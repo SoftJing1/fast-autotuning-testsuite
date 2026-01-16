@@ -34,6 +34,3 @@ python3 -m scripts.get_tuning_parameters kernel-template/gemm_1.cl --json gemm1_
 # run tests
 pytest -q
 ```
-
-If you want, I can extend the parser to group parameters by intent (work-item vs cache sizes), emit a `requirements.txt`, or add an example pipeline that converts extracted parameters into a tuning configuration.
-
