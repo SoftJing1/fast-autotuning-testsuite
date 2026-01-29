@@ -140,7 +140,6 @@ def compile_opencl_to_llvm(
         '-S',
         '-x', 'cl',
         '-cl-std=CL2.0',
-        '-fPIC',
         '-include', params_path,
         template_path,
         '-o', output_ll_path
