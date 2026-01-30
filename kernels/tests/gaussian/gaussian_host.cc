@@ -7,29 +7,7 @@
 #define CL_USE_DEPRECATED_OPENCL_1_2_APIS
 #include <CL/cl.h>
 
-// Tuning parameters from tuning_params/gaussian/gaussian_1024x1024_000000.cl
-#define G_CB_RES_DEST_LEVEL 2
-#define L_CB_RES_DEST_LEVEL 0
-#define P_CB_RES_DEST_LEVEL 0
-#define IMAGES_CACHE_LCL 0
-#define IMAGES_CACHE_PRV 0
-#define FILTER_CACHE_LCL 0
-#define FILTER_CACHE_PRV 0
-#define OUT_CACHE_PRV 0
-#define WG_1_OCL_DIM 1
-#define WG_2_OCL_DIM 0
-#define WI_1_OCL_DIM 1
-#define WI_2_OCL_DIM 0
-#define GLB_1 1
-#define WG_1 1
-#define LCL_1 1
-#define WI_1 1
-#define PRV_1 1024
-#define GLB_2 1
-#define WG_2 1
-#define LCL_2 1
-#define WI_2 1
-#define PRV_2 1024
+#include "gaussian_1024x1024_000000.cl"  // Tuning parameters
 
 std::string read_kernel_source(const char *filename) {
     std::ifstream file(filename);

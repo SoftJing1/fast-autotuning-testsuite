@@ -125,7 +125,18 @@ def is_configuration_valid(
     Constraints are based on the validation logic from rl.cpp:
     - Work item sizes must not exceed hardware limits
     - Work item dimensions must be different
+    - Cache block sizes must be >= work item counts (prevents division by zero in macros)
     - Divisibility constraints for L_CB_SIZE, P_CB_SIZE, NUM_WG, NUM_WI decomposition
+    
+    CRITICAL CONSTRAINT:
+    The preprocessor macro K1_L_NUM_CACHED_ITERATIONS = L_CB_SIZE / NUM_WI is computed
+    at compile time. If L_CB_SIZE < NUM_WI, integer division results in 0, causing
+    division by zero in other macros like K1_L_NUM_STEPS = G_NUM_CACHED / L_NUM_CACHED.
+    
+    Example of invalid config:
+    L_CB_SIZE_R_1 = 1, NUM_WI_R_1 = 16
+    → K1_L_NUM_CACHED_ITERATIONS_R_1 = 1 / 16 = 0  (integer division)
+    → K1_L_NUM_STEPS_R_1 = ... / 0  (division by zero error)
     
     Args:
         config: Dictionary with parameter values
@@ -147,6 +158,18 @@ def is_configuration_valid(
 
     # Dimension constraints - must be different
     if cfg['OCL_DIM_L_1'] == cfg['OCL_DIM_R_1']:
+        return False
+
+    # CRITICAL: Cache block sizes must be >= work item counts
+    # This ensures K1_L_NUM_CACHED_ITERATIONS = L_CB_SIZE / NUM_WI > 0
+    # Without this, preprocessor division by zero occurs
+    if cfg['L_CB_SIZE_L_1'] < cfg['NUM_WI_L_1']:
+        return False
+    if cfg['L_CB_SIZE_R_1'] < cfg['NUM_WI_R_1']:
+        return False
+    
+    # P_CB_SIZE should also be >= 1 (always true but good to check)
+    if cfg['P_CB_SIZE_L_1'] < 1 or cfg['P_CB_SIZE_R_1'] < 1:
         return False
 
     # L_1 divisibility constraints: INPUT_SIZE = L_CB_SIZE * NUM_WG * NUM_WI * P_CB_SIZE
@@ -232,7 +255,7 @@ def generate_tuned_kernel(
 
     # Validate configuration
     if not is_configuration_valid(config, max_wi_size, max_wg_size):
-        print(f"Error: Invalid configuration", file=sys.stderr)
+        print(f"Warning: Invalid configuration", file=sys.stderr)
         return False
 
     # Read template
@@ -286,7 +309,7 @@ def save_tuning_parameters_only(
 
     # Validate configuration
     if not is_configuration_valid(config, max_wi_size, max_wg_size):
-        print(f"Error: Invalid configuration", file=sys.stderr)
+        print(f"Warning: Invalid configuration", file=sys.stderr)
         return False
 
     # Create parameter definitions only

@@ -248,7 +248,7 @@ def generate_tuned_kernel(
 
     # Validate configuration
     if not is_configuration_valid(config, max_wi_size, max_wg_size):
-        print(f"Error: Invalid configuration", file=sys.stderr)
+        print(f"Warning: Invalid configuration", file=sys.stderr)
         return False
 
     # Read template
@@ -302,7 +302,7 @@ def save_tuning_parameters_only(
 
     # Validate configuration
     if not is_configuration_valid(config, max_wi_size, max_wg_size):
-        print(f"Error: Invalid configuration", file=sys.stderr)
+        print(f"Warning: Invalid configuration", file=sys.stderr)
         return False
 
     # Create parameter definitions only

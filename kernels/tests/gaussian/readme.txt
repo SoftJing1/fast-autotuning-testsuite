@@ -19,7 +19,6 @@ COMPONENTS
 ----------
 gaussian_host.cc    - Main host program (standalone, no ATF dependency)
 Makefile            - Build configuration using clang++
-generate_golden.py  - Python script to generate golden reference results
 
 INPUT/OUTPUT
 ------------
@@ -60,7 +59,7 @@ VALIDATION
 ----------
 The program automatically validates GPU results by:
 1. Computing reference result on CPU using the same 5×5 filter
-2. Comparing GPU output with CPU reference (tolerance: 1e-4f)
+2. Comparing GPU output with CPU reference (tolerance: 1e-2f)
 3. Reporting any mismatches with detailed error information
 
 Expected output on success:

@@ -166,6 +166,15 @@ def is_configuration_valid(
     if len(dims) != 3:
         return False
 
+    # Cache block size must be >= work item size to avoid division by zero in macro calculations
+    # K1_L_NUM_CACHED_ITERATIONS = L_CB_SIZE / NUM_WI must be >= 1
+    if cfg['L_CB_SIZE_L_1'] < cfg['NUM_WI_L_1']:
+        return False
+    if cfg['L_CB_SIZE_L_2'] < cfg['NUM_WI_L_2']:
+        return False
+    if cfg['L_CB_SIZE_R_1'] < cfg['NUM_WI_R_1']:
+        return False
+
     # L_1 divisibility constraints: INPUT_SIZE = L_CB_SIZE * NUM_WG * NUM_WI * P_CB_SIZE
     if cfg['INPUT_SIZE_L_1'] % cfg['L_CB_SIZE_L_1'] != 0:
         return False
@@ -262,7 +271,7 @@ def generate_tuned_kernel(
 
     # Validate configuration
     if not is_configuration_valid(config, max_wi_size, max_wg_size):
-        print(f"Error: Invalid configuration", file=sys.stderr)
+        print(f"Warning: Invalid configuration", file=sys.stderr)
         return False
 
     # Read template
@@ -316,7 +325,7 @@ def save_tuning_parameters_only(
 
     # Validate configuration
     if not is_configuration_valid(config, max_wi_size, max_wg_size):
-        print(f"Error: Invalid configuration", file=sys.stderr)
+        print(f"Warning: Invalid configuration", file=sys.stderr)
         return False
 
     # Create parameter definitions only

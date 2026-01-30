@@ -214,6 +214,10 @@ def is_configuration_valid(
         NUM_WG = cfg[f'NUM_WG_L_{i}']
         NUM_WI = cfg[f'NUM_WI_L_{i}']
         P_CB_SIZE = cfg[f'P_CB_SIZE_L_{i}']
+
+        # Prevent zero cached-iteration counts in generated kernels
+        if L_CB_SIZE < NUM_WI:
+            return False
         
         if INPUT_SIZE % L_CB_SIZE != 0:
             return False
@@ -233,6 +237,10 @@ def is_configuration_valid(
     NUM_WG = cfg['NUM_WG_R_1']
     NUM_WI = cfg['NUM_WI_R_1']
     P_CB_SIZE = cfg['P_CB_SIZE_R_1']
+
+    # Prevent zero cached-iteration counts in generated kernels
+    if L_CB_SIZE < NUM_WI:
+        return False
     
     if INPUT_SIZE % L_CB_SIZE != 0:
         return False
@@ -299,7 +307,7 @@ def generate_tuned_kernel(
 
     # Validate configuration
     if not is_configuration_valid(config, max_wi_size, max_wg_size):
-        print(f"Error: Invalid configuration", file=sys.stderr)
+        print(f"Warning: Invalid configuration", file=sys.stderr)
         return False
 
     # Read template
@@ -350,7 +358,7 @@ def save_tuning_parameters_only(
 
     # Validate configuration
     if not is_configuration_valid(config, max_wi_size, max_wg_size):
-        print(f"Error: Invalid configuration", file=sys.stderr)
+        print(f"Warning: Invalid configuration", file=sys.stderr)
         return False
 
     # Create parameter definitions only
@@ -602,10 +610,10 @@ def random_sample_configurations(
 
     seen = set()
     generated = 0
-    valid = 0
+    valid_count = 0
 
     # Generate samples until N valid kernels are produced
-    while valid < num_samples:
+    while valid_count < num_samples:
 
         # Random cache flags
         cache_combo = tuple(random.choice(v) for v in cache_flag_values)
@@ -660,7 +668,7 @@ def random_sample_configurations(
         seen.add(key)
         generated += 1
         if is_configuration_valid(config, max_wi_size, max_wg_size):
-            valid += 1
+            valid_count += 1
             
         yield config
 
