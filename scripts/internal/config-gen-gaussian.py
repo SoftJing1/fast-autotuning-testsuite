@@ -277,17 +277,21 @@ def generate_tuned_kernel(
 def save_tuning_parameters_only(
     config: Dict,
     output_path: str,
-    device_type: str = "cpu"
+    device_type: str = "cpu",
+    input_size_h: int = None,
+    input_size_w: int = None
 ) -> bool:
-    """Save only the tuning parameter definitions without the template.
+    """Save tuning parameters and input sizes as JSON file.
     
-    Outputs a .cl file containing only the #define directives for tuning parameters.
-    Used for exhaustive search to generate compact parameter definition files.
+    Outputs a .json file containing the tuning parameters and input dimensions.
+    Used for exhaustive search to generate configuration files.
     
     Args:
         config: Dictionary with parameter names and values
-        output_path: Where to write the parameter definitions
+        output_path: Where to write the configuration file (.json extension recommended)
         device_type: Device type ("cpu" or "gpu") - used for validation
+        input_size_h: Height input dimension (optional, will use INPUT_SIZE_1 from config if not provided)
+        input_size_w: Width input dimension (optional, will use INPUT_SIZE_2 from config if not provided)
     
     Returns:
         True if save succeeded, False otherwise
@@ -305,17 +309,32 @@ def save_tuning_parameters_only(
         print(f"Warning: Invalid configuration", file=sys.stderr)
         return False
 
-    # Create parameter definitions only
-    defines = "\n".join([f"#define {k} {v}" for k, v in sorted(config.items())])
+    # Create JSON configuration with input sizes and tuning parameters
+    json_config = {}
+    
+    # Add input sizes
+    if input_size_h is not None:
+        json_config['input_size_h'] = input_size_h
+    elif 'INPUT_SIZE_1' in config:
+        json_config['input_size_h'] = config['INPUT_SIZE_1']
+    
+    if input_size_w is not None:
+        json_config['input_size_w'] = input_size_w
+    elif 'INPUT_SIZE_2' in config:
+        json_config['input_size_w'] = config['INPUT_SIZE_2']
+    
+    # Add tuning parameters (convert keys to lowercase with underscores)
+    for k, v in config.items():
+        json_config[k.lower()] = v
 
-    # Write output
+    # Write output as JSON
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     try:
         with open(output_path, 'w') as f:
-            f.write(defines + "\n")
+            json.dump(json_config, f, indent=2)
         return True
     except IOError as e:
-        print(f"Error writing parameters: {e}", file=sys.stderr)
+        print(f"Error writing configuration: {e}", file=sys.stderr)
         return False
 
 
@@ -776,11 +795,12 @@ def cmd_exhaustive(args) -> int:
         if args.max and generated >= args.max:
             break
 
-        # Create output filename
-        output_file = os.path.join(output_dir, f"gaussian_{H}x{W}_{i:06d}.cl")
+        # Create output filename with .json extension
+        output_file = os.path.join(output_dir, f"gaussian_{H}x{W}_{i:06d}.json")
 
-        # Save tuning parameters only (no json, no template)
-        if save_tuning_parameters_only(config, output_file, device_type=args.device_type):
+        # Save tuning parameters as JSON with input sizes
+        if save_tuning_parameters_only(config, output_file, device_type=args.device_type,
+                                      input_size_h=H, input_size_w=W):
             generated += 1
             if args.verbose:
                 print(f"[{generated}] Generated: {output_file}")

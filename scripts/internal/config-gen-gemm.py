@@ -300,17 +300,23 @@ def generate_tuned_kernel(
 def save_tuning_parameters_only(
     config: Dict,
     output_path: str,
-    device_type: str = "cpu"
+    device_type: str = "cpu",
+    M: int = None,
+    N: int = None,
+    K: int = None
 ) -> bool:
-    """Save only the tuning parameter definitions without the template.
+    """Save tuning parameters and matrix dimensions as JSON file.
     
-    Outputs a .cl file containing only the #define directives for tuning parameters.
-    Used for exhaustive search to generate compact parameter definition files.
+    Outputs a .json file containing the tuning parameters and matrix dimensions.
+    Used for exhaustive search to generate configuration files.
     
     Args:
         config: Dictionary with parameter names and values
-        output_path: Where to write the parameter definitions
+        output_path: Where to write the configuration file (.json extension recommended)
         device_type: Device type ("cpu" or "gpu") - used for validation
+        M: M dimension (optional, will use INPUT_SIZE_L_1 from config if not provided)
+        N: N dimension (optional, will use INPUT_SIZE_L_2 from config if not provided)
+        K: K dimension (optional, will use INPUT_SIZE_R_1 from config if not provided)
     
     Returns:
         True if save succeeded, False otherwise
@@ -328,17 +334,37 @@ def save_tuning_parameters_only(
         print(f"Warning: Invalid configuration", file=sys.stderr)
         return False
 
-    # Create parameter definitions only
-    defines = "\n".join([f"#define {k} {v}" for k, v in sorted(config.items())])
+    # Create JSON configuration with matrix dimensions and tuning parameters
+    json_config = {}
+    
+    # Add matrix dimensions
+    if M is not None:
+        json_config['M'] = M
+    elif 'INPUT_SIZE_L_1' in config:
+        json_config['M'] = config['INPUT_SIZE_L_1']
+    
+    if N is not None:
+        json_config['N'] = N
+    elif 'INPUT_SIZE_L_2' in config:
+        json_config['N'] = config['INPUT_SIZE_L_2']
+    
+    if K is not None:
+        json_config['K'] = K
+    elif 'INPUT_SIZE_R_1' in config:
+        json_config['K'] = config['INPUT_SIZE_R_1']
+    
+    # Add tuning parameters (convert keys to lowercase with underscores)
+    for k, v in config.items():
+        json_config[k.lower()] = v
 
-    # Write output
+    # Write output as JSON
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     try:
         with open(output_path, 'w') as f:
-            f.write(defines + "\n")
+            json.dump(json_config, f, indent=2)
         return True
     except IOError as e:
-        print(f"Error writing parameters: {e}", file=sys.stderr)
+        print(f"Error writing configuration: {e}", file=sys.stderr)
         return False
 
 
@@ -814,11 +840,12 @@ def cmd_exhaustive(args) -> int:
         if args.max and generated >= args.max:
             break
 
-        # Create output filename
-        output_file = os.path.join(output_dir, f"gemm_{M}x{N}x{K}_{i:06d}.cl")
+        # Create output filename with .json extension
+        output_file = os.path.join(output_dir, f"gemm_{M}x{N}x{K}_{i:06d}.json")
 
-        # Save tuning parameters only (no json, no template)
-        if save_tuning_parameters_only(config, output_file, device_type=args.device_type):
+        # Save tuning parameters as JSON with matrix dimensions
+        if save_tuning_parameters_only(config, output_file, device_type=args.device_type,
+                                      M=M, N=N, K=K):
             generated += 1
             if args.verbose:
                 print(f"[{generated}] Generated: {output_file}")

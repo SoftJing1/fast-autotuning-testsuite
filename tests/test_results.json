@@ -1,0 +1,142 @@
+[
+  {
+    "kernel_type": "gaussian",
+    "variant_id": 0,
+    "success": false,
+    "runtime_ms": 1181.5555095672607,
+    "error": ""
+  },
+  {
+    "kernel_type": "gaussian",
+    "variant_id": 1,
+    "success": false,
+    "runtime_ms": 1163.3164882659912,
+    "error": ""
+  },
+  {
+    "kernel_type": "gaussian",
+    "variant_id": 2,
+    "success": false,
+    "runtime_ms": 590.2261734008789,
+    "error": ""
+  },
+  {
+    "kernel_type": "gaussian",
+    "variant_id": 3,
+    "success": false,
+    "runtime_ms": 605.2811145782471,
+    "error": ""
+  },
+  {
+    "kernel_type": "gaussian",
+    "variant_id": 4,
+    "success": false,
+    "runtime_ms": 530.7779312133789,
+    "error": ""
+  },
+  {
+    "kernel_type": "gaussian",
+    "variant_id": 5,
+    "success": false,
+    "runtime_ms": 519.8748111724854,
+    "error": ""
+  },
+  {
+    "kernel_type": "gaussian",
+    "variant_id": 6,
+    "success": false,
+    "runtime_ms": 765.2719020843506,
+    "error": ""
+  },
+  {
+    "kernel_type": "gaussian",
+    "variant_id": 7,
+    "success": false,
+    "runtime_ms": 953.202486038208,
+    "error": ""
+  },
+  {
+    "kernel_type": "gaussian",
+    "variant_id": 8,
+    "success": false,
+    "runtime_ms": 888.392448425293,
+    "error": ""
+  },
+  {
+    "kernel_type": "gaussian",
+    "variant_id": 9,
+    "success": false,
+    "runtime_ms": 563.4207725524902,
+    "error": ""
+  },
+  {
+    "kernel_type": "gemm",
+    "variant_id": 13,
+    "success": true,
+    "runtime_ms": 2079.4851779937744,
+    "error": ""
+  },
+  {
+    "kernel_type": "gemm",
+    "variant_id": 29,
+    "success": false,
+    "runtime_ms": 1662.3704433441162,
+    "error": "Compilation error:\n(): Warning: Function gemm_1 is a kernel, so overriding noinline attribute. The function may be inlined when called.\n(): Warning: Function gemm_2 is a kernel, so overriding noinline attribute. The function may be inlined when called.\nptxas error   : Entry function 'gemm_2' uses too much shared data (0x48004 bytes, 0xc000 max)\n\n"
+  },
+  {
+    "kernel_type": "gemm",
+    "variant_id": 32,
+    "success": true,
+    "runtime_ms": 2051.321029663086,
+    "error": ""
+  },
+  {
+    "kernel_type": "gemm",
+    "variant_id": 34,
+    "success": false,
+    "runtime_ms": 2123.927354812622,
+    "error": ""
+  },
+  {
+    "kernel_type": "gemm",
+    "variant_id": 35,
+    "success": true,
+    "runtime_ms": 1900.235652923584,
+    "error": ""
+  },
+  {
+    "kernel_type": "gemm",
+    "variant_id": 36,
+    "success": false,
+    "runtime_ms": 1512.7449035644531,
+    "error": "Compilation error:\n(): Warning: Function gemm_1 is a kernel, so overriding noinline attribute. The function may be inlined when called.\n(): Warning: Function gemm_2 is a kernel, so overriding noinline attribute. The function may be inlined when called.\nptxas error   : Entry function 'gemm_2' uses too much shared data (0x10004 bytes, 0xc000 max)\n\n"
+  },
+  {
+    "kernel_type": "gemm",
+    "variant_id": 39,
+    "success": false,
+    "runtime_ms": 2651.0660648345947,
+    "error": "Compilation error:\n(): Warning: Function gemm_1 is a kernel, so overriding noinline attribute. The function may be inlined when called.\n(): Warning: Function gemm_2 is a kernel, so overriding noinline attribute. The function may be inlined when called.\nptxas error   : Entry function 'gemm_2' uses too much shared data (0x42004 bytes, 0xc000 max)\nptxas error   : Entry function 'gemm_1' uses too much shared data (0x12404 bytes, 0xc000 max)\n\n"
+  },
+  {
+    "kernel_type": "gemm",
+    "variant_id": 43,
+    "success": true,
+    "runtime_ms": 2135.9517574310303,
+    "error": ""
+  },
+  {
+    "kernel_type": "gemm",
+    "variant_id": 57,
+    "success": true,
+    "runtime_ms": 2422.811269760132,
+    "error": ""
+  },
+  {
+    "kernel_type": "gemm",
+    "variant_id": 69,
+    "success": false,
+    "runtime_ms": 1349.2600917816162,
+    "error": "Compilation error:\n(): Warning: Function gemm_1 is a kernel, so overriding noinline attribute. The function may be inlined when called.\n(): Warning: Function gemm_2 is a kernel, so overriding noinline attribute. The function may be inlined when called.\nptxas error   : Entry function 'gemm_2' uses too much shared data (0x20004 bytes, 0xc000 max)\nptxas error   : Entry function 'gemm_1' uses too much shared data (0x11204 bytes, 0xc000 max)\n\n"
+  }
+]
