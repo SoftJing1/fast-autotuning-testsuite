@@ -6,7 +6,6 @@
 #include <fstream>
 #include <iostream>
 #include <nlohmann/json.hpp>
-#include <unordered_map>
 #include <vector>
 
 #define CL_USE_DEPRECATED_OPENCL_1_2_APIS

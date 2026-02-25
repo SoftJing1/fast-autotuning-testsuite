@@ -2,3 +2,4 @@ __pycache__
 .pytest_cache
 build/
 .cache/
+test_results.json
