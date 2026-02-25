@@ -11,7 +11,7 @@ import glob
 import pytest
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import json
 import time
 
@@ -31,12 +31,12 @@ class TestResult:
 class KernelTestRunner:
     """Manages building and testing kernel variants"""
     
-    def __init__(self, build_dir: str = None, source_dir: str = None):
+    def __init__(self, build_dir: Optional[str] = None, source_dir: Optional[str] = None):
         # Default paths
         if source_dir is None:
-            source_dir = Path(__file__).parent.parent
+            source_dir = str(Path(__file__).parent.parent)
         if build_dir is None:
-            build_dir = source_dir / "build"
+            build_dir = str(Path(source_dir) / "build")
             
         self.source_dir = Path(source_dir)
         self.build_dir = Path(build_dir)
@@ -145,8 +145,8 @@ class KernelTestRunner:
                 error_msg=str(e)
             )
     
-    def run_all_tests(self, kernel_type: str = None, 
-                     max_variants: int = None) -> List[TestResult]:
+    def run_all_tests(self, kernel_type: Optional[str] = None, 
+                     max_variants: Optional[int] = None) -> List[TestResult]:
         """
         Run all discovered tuning parameter variants.
         
@@ -270,7 +270,7 @@ def main():
     
     # For quick testing, limit to first 10 variants
     print("=== Quick Test (10 variants per kernel) ===\n")
-    results = runner.run_all_tests(max_variants=10)
+    results = runner.run_all_tests(max_variants=30)
     
     # Summary
     gaussian_results = [r for r in results if r.kernel_type == "gaussian"]
