@@ -270,7 +270,7 @@ def main():
     
     # For quick testing, limit to first 10 variants
     print("=== Quick Test (10 variants per kernel) ===\n")
-    results = runner.run_all_tests(max_variants=30)
+    results = runner.run_all_tests(max_variants=100)
     
     # Summary
     gaussian_results = [r for r in results if r.kernel_type == "gaussian"]
