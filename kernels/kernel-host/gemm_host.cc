@@ -339,6 +339,21 @@ bool is_all_zero_output(const std::vector<float> &values) {
 }
 
 int main(int argc, char *argv[]) {
+  using WallClock = std::chrono::steady_clock;
+  const auto program_start_time = WallClock::now();
+  auto phase_start_time = program_start_time;
+  std::vector<std::pair<std::string, double>> phase_timings_ms;
+
+  auto record_phase = [&](const std::string &phase_name) {
+    const auto now = WallClock::now();
+    const auto phase_duration_ms =
+        std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+            now - phase_start_time)
+            .count();
+    phase_timings_ms.emplace_back(phase_name, phase_duration_ms);
+    phase_start_time = now;
+  };
+
   // Load configuration from JSON file
   std::string config_path = "config.json";
   if (argc > 1) {
@@ -351,6 +366,7 @@ int main(int argc, char *argv[]) {
   }
 
   GemmConfig config = load_config_from_json(config_path);
+  record_phase("Arg parsing + config load");
 
   std::cout << "Using configuration from: " << config_path << std::endl;
   std::cout << "Matrix dimensions: M=" << config.M << ", N=" << config.N
@@ -551,6 +567,7 @@ int main(int argc, char *argv[]) {
             << " x " << global_size[2] << std::endl;
   std::cout << "Local size: " << local_size[0] << " x " << local_size[1]
             << " x " << local_size[2] << std::endl;
+  record_phase("OpenCL setup + kernel preparation");
 
   // Execute gemm_1 kernel
   std::cout << "\n--- Executing gemm_1 kernel ---" << std::endl;
@@ -683,6 +700,7 @@ int main(int argc, char *argv[]) {
     dump_system_diagnostics("gemm all-zero output detected");
     return EXIT_FAILURE;
   }
+  record_phase("Device execution + readback");
 
   // Compute CPU reference result
   std::vector<float> ref_c(M * N);
@@ -700,6 +718,7 @@ int main(int argc, char *argv[]) {
   clGetEventProfilingInfo(event_1, CL_PROFILING_COMMAND_END, sizeof(cl_ulong),
                           &end_time, nullptr);
   unsigned long long runtime_ns = end_time - start_time;
+  record_phase("CPU reference compute");
 
   std::cout << "CPU reference execution time: " << (reference_runtime_ns / 1000000.0)
             << " ms" << std::endl;
@@ -711,8 +730,17 @@ int main(int argc, char *argv[]) {
 
   // Validate results
   std::cout << "\n" << std::string(50, '=') << std::endl;
+  auto validation_start_time = std::chrono::high_resolution_clock::now();
   bool valid = validate_result(c, ref_c, M * N);
+  auto validation_end_time = std::chrono::high_resolution_clock::now();
+  auto validation_runtime_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          validation_end_time - validation_start_time)
+          .count();
+  std::cout << "Reference check execution time: "
+            << (validation_runtime_ns / 1000000.0) << " ms" << std::endl;
   std::cout << std::string(50, '=') << std::endl;
+  record_phase("Reference check");
 
   if (!valid) {
     dump_system_diagnostics("gemm result validation mismatch");
@@ -730,6 +758,29 @@ int main(int argc, char *argv[]) {
   clReleaseMemObject(buf_int_res);
   clReleaseCommandQueue(queue);
   clReleaseContext(context);
+  record_phase("Cleanup");
+
+  double accounted_ms = 0.0;
+  for (const auto &phase_timing : phase_timings_ms) {
+    accounted_ms += phase_timing.second;
+  }
+  const auto total_program_ms =
+      std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+          WallClock::now() - program_start_time)
+          .count();
+
+  std::cout << "\n" << std::string(50, '=') << std::endl;
+  std::cout << "Coarse timing breakdown (wall-clock):" << std::endl;
+  for (const auto &phase_timing : phase_timings_ms) {
+    std::cout << "  " << phase_timing.first << ": " << phase_timing.second
+              << " ms" << std::endl;
+  }
+  std::cout << "  Accounted total: " << accounted_ms << " ms" << std::endl;
+  std::cout << "  Whole program:   " << total_program_ms << " ms"
+            << std::endl;
+  std::cout << "  Unaccounted:     " << (total_program_ms - accounted_ms)
+            << " ms" << std::endl;
+  std::cout << std::string(50, '=') << std::endl;
 
   return valid ? EXIT_SUCCESS : EXIT_FAILURE;
 }

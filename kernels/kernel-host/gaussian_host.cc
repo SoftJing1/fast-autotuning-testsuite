@@ -1,4 +1,5 @@
 #include <CL/cl_platform.h>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -396,6 +397,21 @@ bool is_all_zero_output(const std::vector<float> &values) {
 }
 
 int main(int argc, char *argv[]) {
+  using WallClock = std::chrono::steady_clock;
+  const auto program_start_time = WallClock::now();
+  auto phase_start_time = program_start_time;
+  std::vector<std::pair<std::string, double>> phase_timings_ms;
+
+  auto record_phase = [&](const std::string &phase_name) {
+    const auto now = WallClock::now();
+    const auto phase_duration_ms =
+        std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+            now - phase_start_time)
+            .count();
+    phase_timings_ms.emplace_back(phase_name, phase_duration_ms);
+    phase_start_time = now;
+  };
+
   // Load configuration from JSON file
   std::string config_path = "config.json";
   if (argc > 1) {
@@ -408,6 +424,7 @@ int main(int argc, char *argv[]) {
   }
 
   GaussianConfig config = load_config_from_json(config_path);
+  record_phase("Arg parsing + config load");
 
   std::cout << "Using configuration from: " << config_path << std::endl;
   std::cout << "Input size: " << config.input_size_h << " x "
@@ -613,6 +630,7 @@ int main(int argc, char *argv[]) {
   std::cout << "Device local memory: " << (local_mem_size / 1024) << " KB"
             << std::endl;
   std::cout << "Max work group size: " << max_work_group_size << std::endl;
+  record_phase("OpenCL setup + kernel preparation");
 
   // Execute kernel
   cl_event event;
@@ -695,6 +713,7 @@ int main(int argc, char *argv[]) {
     dump_system_diagnostics("all-zero output detected");
     return EXIT_FAILURE;
   }
+  record_phase("Device execution + readback");
 
   // Compute CPU reference result
   std::vector<float> ref_out(H * W);
@@ -712,6 +731,7 @@ int main(int argc, char *argv[]) {
   clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(cl_ulong),
                           &end_time, nullptr);
   unsigned long long runtime_ns = end_time - start_time;
+  record_phase("CPU reference compute");
 
   std::cout << "Reference CPU execution time: " << (ref_runtime_ns / 1000000.0)
             << " ms" << std::endl;
@@ -722,8 +742,17 @@ int main(int argc, char *argv[]) {
 
   // Validate results
   std::cout << "\n" << std::string(50, '=') << std::endl;
+  auto validation_start_time = std::chrono::high_resolution_clock::now();
   bool valid = validate_result(out, ref_out, H * W);
+  auto validation_end_time = std::chrono::high_resolution_clock::now();
+  auto validation_runtime_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          validation_end_time - validation_start_time)
+          .count();
+  std::cout << "Reference check execution time: "
+            << (validation_runtime_ns / 1000000.0) << " ms" << std::endl;
   std::cout << std::string(50, '=') << std::endl;
+  record_phase("Reference check");
 
   if (!valid) {
     dump_system_diagnostics("result validation mismatch");
@@ -738,6 +767,29 @@ int main(int argc, char *argv[]) {
   clReleaseMemObject(buf_out);
   clReleaseCommandQueue(queue);
   clReleaseContext(context);
+  record_phase("Cleanup");
+
+  double accounted_ms = 0.0;
+  for (const auto &phase_timing : phase_timings_ms) {
+    accounted_ms += phase_timing.second;
+  }
+  const auto total_program_ms =
+      std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+          WallClock::now() - program_start_time)
+          .count();
+
+  std::cout << "\n" << std::string(50, '=') << std::endl;
+  std::cout << "Coarse timing breakdown (wall-clock):" << std::endl;
+  for (const auto &phase_timing : phase_timings_ms) {
+    std::cout << "  " << phase_timing.first << ": " << phase_timing.second
+              << " ms" << std::endl;
+  }
+  std::cout << "  Accounted total: " << accounted_ms << " ms" << std::endl;
+  std::cout << "  Whole program:   " << total_program_ms << " ms"
+            << std::endl;
+  std::cout << "  Unaccounted:     " << (total_program_ms - accounted_ms)
+            << " ms" << std::endl;
+  std::cout << std::string(50, '=') << std::endl;
 
   return valid ? EXIT_SUCCESS : EXIT_FAILURE;
 }
