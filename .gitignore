@@ -5,3 +5,4 @@ build/
 test_results.json
 experiments/
 .venv/
+validation/

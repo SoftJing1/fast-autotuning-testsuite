@@ -60,7 +60,7 @@ def _parse_hex_count(value: str) -> int:
 		return int(value[2:], 16)
 	if value.startswith("0x"):
 		return int(value, 16)
-	return int(value)
+	return -1
 
 
 def _run_symb_viewer(command: List[str]) -> None:
