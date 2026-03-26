@@ -12,11 +12,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
-from typing import Tuple
+from typing import Dict, Tuple
 
 
 # =============================================================================
@@ -24,55 +26,108 @@ from typing import Tuple
 # =============================================================================
 
 
+def json_params_to_cl_defines(params_dict: Dict) -> str:
+	"""Convert JSON parameter dictionary to OpenCL #define statements.
+	
+	Maps JSON keys to uppercase macro names following the naming convention
+	used in the kernel templates.
+	
+	Args:
+		params_dict: Dictionary of parameter name -> value
+	
+	Returns:
+		String containing OpenCL #define statements
+	"""
+	lines = []
+	for key, value in sorted(params_dict.items()):
+		# Convert snake_case to UPPER_CASE
+		macro_name = key.upper()
+		lines.append(f"#define {macro_name} {value}")
+	return "\n".join(lines)
+
+
+def load_json_params(params_path: str) -> Dict:
+	"""Load tuning parameters from JSON file.
+	
+	Args:
+		params_path: Path to JSON file containing parameters
+	
+	Returns:
+		Dictionary of parameter name -> value
+	
+	Raises:
+		IOError: If file cannot be read
+		json.JSONDecodeError: If JSON is invalid
+	"""
+	try:
+		with open(params_path, 'r') as f:
+			return json.load(f)
+	except IOError as e:
+		print(f"Error reading JSON params: {e}", file=sys.stderr)
+		raise
+	except json.JSONDecodeError as e:
+		print(f"Error parsing JSON params: {e}", file=sys.stderr)
+		raise
+
+
 def merge_opencl_files(
-    template_path: str,
-    params_path: str,
-    output_path: str | None = None
+	template_path: str,
+	params_path: str,
+	output_path: str | None = None
 ) -> str:
-    """Merge kernel template with tuning parameter definitions.
-    
-    Combines the parameter definitions from params_path with the kernel
-    template to create a complete OpenCL source file.
-    
-    Args:
-        template_path: Path to kernel template (.cl file)
-        params_path: Path to tuning parameters definition (.cl file)
-        output_path: Optional path to save merged file (returns content if None)
-    
-    Returns:
-        Content of merged file or path if output_path specified
-    """
-    # Read template
-    try:
-        with open(template_path, 'r') as f:
-            template_content = f.read()
-    except IOError as e:
-        print(f"Error reading template: {e}", file=sys.stderr)
-        raise
+	"""Merge kernel template with tuning parameter definitions.
+	
+	Combines the parameter definitions from params_path with the kernel
+	template to create a complete OpenCL source file.
+	
+	Supports both .cl and .json parameter files:
+	- .cl files are included directly
+	- .json files are converted to #define statements
+	
+	Args:
+		template_path: Path to kernel template (.cl file)
+		params_path: Path to tuning parameters (.cl or .json file)
+		output_path: Optional path to save merged file (returns content if None)
+	
+	Returns:
+		Content of merged file or path if output_path specified
+	"""
+	# Read template
+	try:
+		with open(template_path, 'r') as f:
+			template_content = f.read()
+	except IOError as e:
+		print(f"Error reading template: {e}", file=sys.stderr)
+		raise
 
-    # Read parameters
-    try:
-        with open(params_path, 'r') as f:
-            params_content = f.read()
-    except IOError as e:
-        print(f"Error reading parameters: {e}", file=sys.stderr)
-        raise
+	# Read or generate parameters
+	if params_path.endswith('.json'):
+		params_dict = load_json_params(params_path)
+		params_content = json_params_to_cl_defines(params_dict)
+	else:
+		# Assume .cl file
+		try:
+			with open(params_path, 'r') as f:
+				params_content = f.read()
+		except IOError as e:
+			print(f"Error reading parameters: {e}", file=sys.stderr)
+			raise
 
-    # Merge: parameters first, then template
-    merged_content = params_content + "\n\n" + template_content
+	# Merge: parameters first, then template
+	merged_content = params_content + "\n\n" + template_content
 
-    # Save if output path provided
-    if output_path:
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        try:
-            with open(output_path, 'w') as f:
-                f.write(merged_content)
-            return output_path
-        except IOError as e:
-            print(f"Error writing merged file: {e}", file=sys.stderr)
-            raise
+	# Save if output path provided
+	if output_path:
+		os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+		try:
+			with open(output_path, 'w') as f:
+				f.write(merged_content)
+			return output_path
+		except IOError as e:
+			print(f"Error writing merged file: {e}", file=sys.stderr)
+			raise
 
-    return merged_content
+	return merged_content
 
 
 def detect_opencl_compiler() -> str:
@@ -104,65 +159,86 @@ def detect_opencl_compiler() -> str:
 
 
 def compile_opencl_to_llvm(
-    template_path: str,
-    params_path: str,
-    output_ll_path: str,
-    target_triple: str | None = None,
-    data_layout: str | None = None
+	template_path: str,
+	params_path: str,
+	output_ll_path: str,
 ) -> bool:
-    """Compile OpenCL template + params to LLVM IR without merging files.
+	"""Compile OpenCL template + params to LLVM IR without merging files.
 
-    Uses clang with `-include <params>` so the tuning parameter definitions are
-    pulled in without concatenating files on disk.
+	Supports both .cl and .json parameter files:
+	- .cl files are included via clang's -include flag
+	- .json files are converted to a temporary .cl file with #define statements
 
-    Args:
-        template_path: Path to kernel template (.cl)
-        params_path: Path to tuning parameter definitions (.cl)
-        output_ll_path: Path to output LLVM IR file (.ll)
-        target_triple: Optional target triple (e.g., x86_64-unknown-linux-gnu)
-        data_layout: Optional data layout specification
+	Args:
+		template_path: Path to kernel template (.cl)
+		params_path: Path to tuning parameter definitions (.cl or .json)
+		output_ll_path: Path to output LLVM IR file (.ll)
+		data_layout: Optional data layout specification
 
-    Returns:
-        True if compilation succeeded, False otherwise
-    """
-    os.makedirs(os.path.dirname(output_ll_path) or ".", exist_ok=True)
+	Returns:
+		True if compilation succeeded, False otherwise
+	"""
+	os.makedirs(os.path.dirname(output_ll_path) or ".", exist_ok=True)
 
-    try:
-        compiler = detect_opencl_compiler()
-    except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return False
+	try:
+		compiler = detect_opencl_compiler()
+	except RuntimeError as e:
+		print(f"Error: {e}", file=sys.stderr)
+		return False
 
-    # Build clang command for LLVM IR generation
-    cmd = [
-        compiler,
-        '-emit-llvm',
-        '-S',
-        '-x', 'cl',
-        '-cl-std=CL2.0',
-        '-include', params_path,
-        template_path,
-        '-o', output_ll_path
-    ]
+	# Handle JSON parameter files by converting to temporary .cl file
+	params_to_include = params_path
+	temp_file = None
 
-    if target_triple:
-        cmd.extend(['-triple', target_triple])
+	if params_path.endswith('.json'):
+		try:
+			params_dict = load_json_params(params_path)
+			params_cl_content = json_params_to_cl_defines(params_dict)
+			
+			# Create temporary .cl file with parameters
+			with tempfile.NamedTemporaryFile(mode='w', suffix='.cl', delete=False) as tmp:
+				tmp.write(params_cl_content)
+				temp_file = tmp.name
+				params_to_include = temp_file
+		except Exception as e:
+			print(f"Error processing JSON parameters: {e}", file=sys.stderr)
+			return False
 
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        
-        if result.returncode != 0:
-            print(f"Compilation error:\n{result.stderr}", file=sys.stderr)
-            return False
+	try:
+		# Build clang command for LLVM IR generation
+		cmd = [
+			compiler,
+			'-emit-llvm',
+			'-S',
+			'-x', 'cl',
+			'-cl-std=CL2.0',
+			'-include', params_to_include,
+			template_path,
+			'-o', output_ll_path
+		]
 
-        if not os.path.exists(output_ll_path):
-            print(f"Error: Output file not created", file=sys.stderr)
-            return False
+		try:
+			result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+			
+			if result.returncode != 0:
+				print(f"Compilation error:\n{result.stderr}", file=sys.stderr)
+				return False
 
-        return True
-    except Exception as e:
-        print(f"Error running compiler: {e}", file=sys.stderr)
-        return False
+			if not os.path.exists(output_ll_path):
+				print(f"Error: Output file not created", file=sys.stderr)
+				return False
+
+			return True
+		except Exception as e:
+			print(f"Error running compiler: {e}", file=sys.stderr)
+			return False
+	finally:
+		# Clean up temporary file
+		if temp_file and os.path.exists(temp_file):
+			try:
+				os.unlink(temp_file)
+			except OSError:
+				pass
 
 
 def compile_kernel_to_standalone_llvm(

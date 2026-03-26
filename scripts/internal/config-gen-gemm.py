@@ -221,16 +221,24 @@ def is_configuration_valid(
 # KERNEL GENERATION
 # =============================================================================
 
+def get_kernel_template_paths() -> Dict[str, str]:
+    """Get the paths to the GEMM kernel templates keyed by template name."""
+    script_dir = Path(__file__).parent
+    kernel_dir = script_dir.parent / "kernels"
+    template_dir = kernel_dir / "kernel-template"
+    return {
+        "gemm_1": str((template_dir / "gemm_1.cl").absolute()),
+        "gemm_2": str((template_dir / "gemm_2.cl").absolute()),
+    }
+
+
 def get_kernel_template_path() -> str:
-    """Get the path to the GEMM kernel template.
+    """Get the default GEMM kernel template path.
     
     Returns:
         Absolute path to gemm_1.cl
     """
-    script_dir = Path(__file__).parent
-    kernel_dir = script_dir.parent / "kernels"
-    template_path = kernel_dir / "kernel-template" / "gemm_1.cl"
-    return str(template_path.absolute())
+    return get_kernel_template_paths()["gemm_1"]
 
 
 def generate_tuned_kernel(

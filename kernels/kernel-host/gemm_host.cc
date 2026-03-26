@@ -722,7 +722,7 @@ int main(int argc, char *argv[]) {
 
   std::cout << "CPU reference execution time: " << (reference_runtime_ns / 1000000.0)
             << " ms" << std::endl;
-  std::cout << "GPU gemm_1 kernel execution time: " << (runtime_ns / 1000000.0)
+  std::cout << "Device kernel execution time: " << (runtime_ns / 1000000.0)
             << " ms" << std::endl;
   std::cout << "Speedup (gemm_1 vs CPU reference): "
             << static_cast<double>(reference_runtime_ns) / runtime_ns << "x"
