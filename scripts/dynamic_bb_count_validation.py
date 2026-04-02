@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_VALIDATION_PAYLOAD = "payload.json"
 if str(ROOT) not in sys.path:
 	sys.path.insert(0, str(ROOT))
 
@@ -58,6 +59,12 @@ class SymbolicCountParseError(RuntimeError):
 		self.raw_counts = raw_counts
 		preview = ", ".join(f"{name}={value}" for name, value in list(raw_counts.items())[:5])
 		super().__init__(f"Non-integer symb-viewer basic block counts: {preview}")
+
+
+@dataclass(frozen=True)
+class RuntimeIdSelection:
+	group_ids: Tuple[int, int, int]
+	local_ids: Tuple[int, int, int]
 
 
 def _require_tool(name: str) -> None:
@@ -419,7 +426,6 @@ def _candidate_runtime_ids(plan: ProxyBuildPlan) -> List[Tuple[Tuple[int, int, i
 def _dynamic_bb_counts(
 	llvm_ir_path: Path,
 	config_path: Path,
-	symb_counts: Dict[str, int],
 	kernel_function: Optional[str] = None,
 ) -> Tuple[Dict[str, int], Dict[str, Tuple[int, int, int]]]:
 	_require_tool("clang")
@@ -459,8 +465,6 @@ def _dynamic_bb_counts(
 			if first_dynamic is None:
 				first_dynamic = dynamic_counts
 				first_ids = {"group_ids": group_ids, "local_ids": local_ids}
-			if all(dynamic_counts.get(name) == count for name, count in symb_counts.items()):
-				return dynamic_counts, {"group_ids": group_ids, "local_ids": local_ids}
 
 	if first_dynamic is None or first_ids is None:
 		raise RuntimeError("Failed to execute any dynamic proxy candidates")
@@ -475,20 +479,61 @@ def _parse_symb_count(raw_count: str) -> int:
 	return int(raw_count)
 
 
-def _symb_viewer_bb_counts(llvm_ir_path: Path, function_name: str) -> Tuple[Dict[str, int], Dict[str, str], str]:
+def _first_runtime_call_dims(llvm_text: str, function_name: str) -> Dict[str, int]:
+	lines = llvm_text.splitlines(keepends=True)
+	start, end, _ = _find_function_region(lines, function_name)
+	body_lines = lines[start + 1:end]
+	pattern = re.compile(r"call\s+\w+\s+@(?P<callee>[^(]+)\(i32(?:\s+\w+)*\s+(?P<dim>\d+)\)")
+	dims: Dict[str, int] = {}
+	for line in body_lines:
+		match = pattern.search(line)
+		if not match:
+			continue
+		callee = match.group("callee")
+		if callee in {"_Z12get_group_idj", "_Z12get_local_idj"} and callee not in dims:
+			dims[callee] = int(match.group("dim"))
+	return dims
+
+
+def _build_symb_substitutions(
+	llvm_text: str,
+	function_name: str,
+	runtime_ids: RuntimeIdSelection,
+) -> Dict[str, int]:
+	call_dims = _first_runtime_call_dims(llvm_text, function_name)
+	substitutions: Dict[str, int] = {}
+	for callee, dim in call_dims.items():
+		if callee == "_Z12get_group_idj":
+			value = int(runtime_ids.group_ids[dim])
+		elif callee == "_Z12get_local_idj":
+			value = int(runtime_ids.local_ids[dim])
+		else:
+			continue
+		substitutions[f"call_ret_{callee}"] = value
+	return substitutions
+
+
+def _symb_viewer_bb_counts(
+	llvm_ir_path: Path,
+	function_name: str,
+	substitutions: Optional[Dict[str, int]] = None,
+) -> Tuple[Dict[str, int], Dict[str, str], str]:
 	_require_tool("symb-viewer")
 	with tempfile.TemporaryDirectory(prefix="symb_bb_") as tmpdir:
-		output_json = Path(tmpdir) / "bb_counts.json"
-		result = _run(
-			[
-				"symb-viewer",
-				"formula",
-				str(llvm_ir_path),
-				function_name,
-				f"--json={output_json}",
-			],
-			cwd=ROOT,
-		)
+		tmp = Path(tmpdir)
+		output_json = tmp / "bb_counts.json"
+		cmd = [
+			"symb-viewer",
+			"formula",
+			str(llvm_ir_path),
+			function_name,
+			f"--json={output_json}",
+		]
+		if substitutions:
+			subs_json = tmp / "symb_subs.json"
+			subs_json.write_text(json.dumps(substitutions, indent=2, sort_keys=True))
+			cmd.append(f"-subs={subs_json}")
+		result = _run(cmd, cwd=ROOT)
 		payload = json.loads(output_json.read_text())
 		tool_messages = "\n".join(part for part in [result.stderr.strip(), result.stdout.strip()] if part).strip()
 
@@ -518,12 +563,20 @@ def compare_bb_counts(
 ) -> Dict[str, object]:
 	llvm_text = llvm_ir_path.read_text()
 	target_function = _resolve_target_function(llvm_text, explicit=kernel_function)
-	symb_counts, symb_raw_counts, symb_tool_messages = _symb_viewer_bb_counts(llvm_ir_path, target_function)
 	dynamic_counts, matched_ids = _dynamic_bb_counts(
 		llvm_ir_path,
 		config_path,
-		symb_counts,
 		kernel_function=target_function,
+	)
+	runtime_ids = RuntimeIdSelection(
+		group_ids=tuple(int(value) for value in matched_ids["group_ids"]),
+		local_ids=tuple(int(value) for value in matched_ids["local_ids"]),
+	)
+	symb_substitutions = _build_symb_substitutions(llvm_text, target_function, runtime_ids)
+	symb_counts, symb_raw_counts, substituted_tool_messages = _symb_viewer_bb_counts(
+		llvm_ir_path,
+		target_function,
+		substitutions=symb_substitutions,
 	)
 
 	missing_dynamic = sorted(set(symb_counts) - set(dynamic_counts))
@@ -545,7 +598,8 @@ def compare_bb_counts(
 		"kernel_function": target_function,
 		"bb_counts": symb_counts,
 		"symb_raw_counts": symb_raw_counts,
-		"symb_tool_messages": symb_tool_messages,
+		"symb_tool_messages": substituted_tool_messages,
+		"symb_substitutions": symb_substitutions,
 		"dynamic_counts": dynamic_counts,
 		"ignored_dynamic_only_blocks": ignored_dynamic,
 		"matched_runtime_ids": matched_ids,
@@ -570,17 +624,78 @@ def validate_bb_counts(
 		"bb_counts": comparison["bb_counts"],
 		"symb_raw_counts": comparison["symb_raw_counts"],
 		"symb_tool_messages": comparison["symb_tool_messages"],
+		"symb_substitutions": comparison["symb_substitutions"],
 		"dynamic_counts": comparison["dynamic_counts"],
 		"ignored_dynamic_only_blocks": comparison["ignored_dynamic_only_blocks"],
 		"matched_runtime_ids": comparison["matched_runtime_ids"],
 	}
 
 
-def _build_validation_run_dir(validation_root: Path, start_seed: int, total_cases: int) -> Path:
-	timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-	run_dir = validation_root / f"run_{timestamp}_seed{start_seed}_count{total_cases}"
+def _build_validation_run_dir(
+	validation_root: Path,
+	start_seed: int,
+	total_cases: int,
+	experiment_name: Optional[str] = None,
+) -> Path:
+	if experiment_name:
+		run_dir = validation_root / experiment_name
+	else:
+		timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+		run_dir = validation_root / f"run_{timestamp}_seed{start_seed}_count{total_cases}"
 	run_dir.mkdir(parents=True, exist_ok=True)
 	return run_dir
+
+
+def _payload_path_for_run(run_dir: Path) -> Path:
+	return run_dir / DEFAULT_VALIDATION_PAYLOAD
+
+
+def _find_reusable_payload(run_dir: Path) -> Optional[Path]:
+	payload_path = _payload_path_for_run(run_dir)
+	if payload_path.exists():
+		return payload_path
+	return None
+
+
+def _ensure_visualization_launcher(run_dir: Path) -> None:
+	launcher_path = run_dir / "run_visualization.py"
+	launcher_code = """#!/usr/bin/env python3
+from __future__ import annotations
+
+import runpy
+import sys
+from pathlib import Path
+
+
+def main() -> int:
+	current = Path(__file__).resolve()
+	repo_root = current.parents[2]
+	script_path = repo_root / "scripts" / "dynamic_bb_count_validation.py"
+	if not script_path.exists():
+		print(f"Validation script not found: {script_path}", file=sys.stderr)
+		return 1
+
+	default_payload = current.parent / "payload.json"
+	sys.argv = [str(script_path), "--load-json", str(default_payload), *sys.argv[1:]]
+	runpy.run_path(str(script_path), run_name="__main__")
+	return 0
+
+
+if __name__ == "__main__":
+	raise SystemExit(main())
+"""
+	launcher_path.write_text(launcher_code)
+	os.chmod(launcher_path, 0o755)
+
+
+def _write_payload(run_dir: Path, payload: Dict[str, object]) -> Path:
+	payload_path = _payload_path_for_run(run_dir)
+	payload_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+	return payload_path
+
+
+def _load_payload(path: Path) -> Dict[str, object]:
+	return json.loads(path.read_text())
 
 
 def _generate_random_artifact_pair(seed: int, validation_root: Path) -> GeneratedArtifactPair:
@@ -739,6 +854,7 @@ def _build_case_record(
 		"llvm_ir_path": comparison.get("llvm_ir_path") if comparison else None,
 		"config_path": comparison.get("config_path") if comparison else None,
 		"symb_tool_messages": symb_tool_messages,
+		"symb_substitutions": comparison.get("symb_substitutions") if comparison else None,
 		"kernel_function": comparison.get("kernel_function") if comparison else None,
 		"matched_runtime_ids": comparison.get("matched_runtime_ids") if comparison else None,
 		"ignored_dynamic_only_blocks": comparison.get("ignored_dynamic_only_blocks", []) if comparison else [],
@@ -836,22 +952,21 @@ def _run_random_validations(
 	return results, skipped, cases
 
 
-def _build_validation_summary(
-	results: Sequence[Dict[str, object]],
-	skipped: Sequence[Dict[str, str]],
-) -> Dict[str, int]:
+def _build_validation_summary(cases: Sequence[Dict[str, object]]) -> Dict[str, int]:
 	summary = {
-		"matched": len(results),
+		"matched": 0,
 		"mismatched": 0,
 		"symbolic": 0,
 		"crashed": 0,
 		"tooling": 0,
-		"other_skipped": 0,
-		"attempted": len(results) + len(skipped),
+		"other": 0,
+		"attempted": len(cases),
 	}
-	for item in skipped:
-		category = _classify_skip_reason(item.get("reason", ""))
-		if category == "mismatched":
+	for case in cases:
+		category = str(case.get("status", ""))
+		if category == "matched":
+			summary["matched"] += 1
+		elif category == "mismatched":
 			summary["mismatched"] += 1
 		elif category == "symbolic":
 			summary["symbolic"] += 1
@@ -860,7 +975,8 @@ def _build_validation_summary(
 		elif category == "tooling":
 			summary["tooling"] += 1
 		else:
-			summary["other_skipped"] += 1
+			summary["other"] += 1
+	summary["other_skipped"] = summary["other"]
 	return summary
 
 
@@ -869,6 +985,27 @@ def _build_visualization_payload(cases: Sequence[Dict[str, object]], summary: Di
 		"summary": summary,
 		"cases": list(cases),
 	}
+
+
+def _attach_run_metadata(
+	payload: Dict[str, object],
+	run_dir: Path,
+	mode: str,
+	seed: int,
+	total_cases: int,
+	kernel_function: Optional[str],
+) -> Dict[str, object]:
+	updated = dict(payload)
+	updated["run"] = {
+		"run_dir": str(run_dir),
+		"payload_path": str(_payload_path_for_run(run_dir)),
+		"mode": mode,
+		"seed": seed,
+		"count": total_cases,
+		"kernel_function": kernel_function,
+		"created_at": datetime.now().isoformat(),
+	}
+	return updated
 
 
 def _pick_server_port(host: str, preferred_port: int) -> Tuple[int, bool]:
@@ -935,9 +1072,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 		help="Directory where generated validation configs and LLVM IR files will be kept.",
 	)
 	parser.add_argument(
+		"--experiment-name",
+		default=None,
+		help="Optional stable name for this validation run. If the named run already has a saved payload, it is reused.",
+	)
+	parser.add_argument(
 		"--dump-json",
 		default=None,
 		help="Optional path to write the investigation payload as JSON.",
+	)
+	parser.add_argument(
+		"--load-json",
+		default=None,
+		help="Load a previously saved investigation payload JSON and visualize it without rerunning validation.",
 	)
 	parser.add_argument(
 		"--no-web",
@@ -948,8 +1095,61 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 	validation_root = Path(args.validation_root).resolve()
 	validation_root.mkdir(parents=True, exist_ok=True)
 
-	if args.llvm_ir or args.config:
+	if args.load_json:
+		payload = _load_payload(Path(args.load_json).resolve())
+	elif args.experiment_name:
+		named_run_dir = _build_validation_run_dir(
+			validation_root,
+			args.seed,
+			args.count,
+			experiment_name=args.experiment_name,
+		)
+		reusable_payload = _find_reusable_payload(named_run_dir)
+		if reusable_payload is not None:
+			payload = _load_payload(reusable_payload)
+		else:
+			_ensure_visualization_launcher(named_run_dir)
+			if args.llvm_ir or args.config:
+				llvm_ir_path, config_path = _resolve_inputs(
+					args.llvm_ir,
+					args.config,
+					args.seed,
+					validation_root=named_run_dir,
+				)
+				case_record = _run_validation_case(
+					case_index=0,
+					seed=None,
+					llvm_ir_path=llvm_ir_path,
+					config_path=config_path,
+					kernel_function=args.kernel_function,
+					artifact_root=llvm_ir_path.parent if not (args.llvm_ir and args.config) else None,
+				)
+				payload = _attach_run_metadata(
+					_build_visualization_payload([case_record], _build_validation_summary([case_record])),
+					run_dir=named_run_dir,
+					mode="single",
+					seed=args.seed,
+					total_cases=1,
+					kernel_function=args.kernel_function,
+				)
+			else:
+				_results, _skipped, cases = _run_random_validations(
+					total_cases=args.count,
+					start_seed=args.seed,
+					validation_root=named_run_dir,
+				)
+				payload = _attach_run_metadata(
+					_build_visualization_payload(cases, _build_validation_summary(cases)),
+					run_dir=named_run_dir,
+					mode="random",
+					seed=args.seed,
+					total_cases=args.count,
+					kernel_function=args.kernel_function,
+				)
+			_write_payload(named_run_dir, payload)
+	elif args.llvm_ir or args.config:
 		single_case_root = _build_validation_run_dir(validation_root, args.seed, 1)
+		_ensure_visualization_launcher(single_case_root)
 		llvm_ir_path, config_path = _resolve_inputs(args.llvm_ir, args.config, args.seed, validation_root=single_case_root)
 		case_record = _run_validation_case(
 			case_index=0,
@@ -959,17 +1159,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 			kernel_function=args.kernel_function,
 			artifact_root=llvm_ir_path.parent if not (args.llvm_ir and args.config) else None,
 		)
-		results = [{}] if case_record["status"] == "matched" else []
-		skipped = [] if case_record["status"] == "matched" else [{"seed": str(args.seed), "reason": str(case_record["reason"])}]
-		payload = _build_visualization_payload([case_record], _build_validation_summary(results, skipped))
+		payload = _attach_run_metadata(
+			_build_visualization_payload([case_record], _build_validation_summary([case_record])),
+			run_dir=single_case_root,
+			mode="single",
+			seed=args.seed,
+			total_cases=1,
+			kernel_function=args.kernel_function,
+		)
+		_write_payload(single_case_root, payload)
 	else:
 		run_validation_root = _build_validation_run_dir(validation_root, args.seed, args.count)
-		results, skipped, cases = _run_random_validations(
+		_ensure_visualization_launcher(run_validation_root)
+		_results, _skipped, cases = _run_random_validations(
 			total_cases=args.count,
 			start_seed=args.seed,
 			validation_root=run_validation_root,
 		)
-		payload = _build_visualization_payload(cases, _build_validation_summary(results, skipped))
+		payload = _attach_run_metadata(
+			_build_visualization_payload(cases, _build_validation_summary(cases)),
+			run_dir=run_validation_root,
+			mode="random",
+			seed=args.seed,
+			total_cases=args.count,
+			kernel_function=args.kernel_function,
+		)
+		_write_payload(run_validation_root, payload)
 
 	if args.dump_json:
 		Path(args.dump_json).write_text(json.dumps(payload, indent=2, sort_keys=True))

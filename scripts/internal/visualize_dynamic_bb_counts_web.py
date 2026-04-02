@@ -18,7 +18,10 @@ def _summary_cards(summary: Dict[str, Any]) -> List[html.Div]:
 	items = [
 		("Matched", summary.get("matched", 0)),
 		("Mismatched", summary.get("mismatched", 0)),
+		("Symbolic", summary.get("symbolic", 0)),
 		("Crashed", summary.get("crashed", 0)),
+		("Tooling", summary.get("tooling", 0)),
+		("Other", summary.get("other", summary.get("other_skipped", 0))),
 		("Attempted", summary.get("attempted", 0)),
 	]
 	return [
