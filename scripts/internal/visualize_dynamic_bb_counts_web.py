@@ -36,6 +36,32 @@ def _summary_cards(summary: Dict[str, Any]) -> List[html.Div]:
 	]
 
 
+def _block_is_comparable(row: Dict[str, Any]) -> bool:
+	return row.get("symb_viewer") is not None and row.get("dynamic") is not None
+
+
+def _block_is_mismatch(row: Dict[str, Any]) -> bool:
+	return _block_is_comparable(row) and row.get("symb_viewer") != row.get("dynamic")
+
+
+def _case_mismatch_count(case: Dict[str, Any]) -> int:
+	basic_blocks = case.get("basic_blocks", [])
+	if not basic_blocks:
+		return int(case.get("mismatch_count", 0) or 0)
+	return sum(1 for row in basic_blocks if _block_is_mismatch(row))
+
+
+def _case_dynamic_only_blocks(case: Dict[str, Any]) -> List[str]:
+	ignored = [str(name) for name in case.get("ignored_dynamic_only_blocks", [])]
+	if ignored:
+		return ignored
+	return [
+		str(row.get("name"))
+		for row in case.get("basic_blocks", [])
+		if row.get("symb_viewer") is None and row.get("dynamic") is not None
+	]
+
+
 def _case_rows(cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 	rows = []
 	for case in cases:
@@ -44,7 +70,7 @@ def _case_rows(cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 				"case_label": case.get("case_label"),
 				"status": case.get("status"),
 				"kernel_function": case.get("kernel_function"),
-				"mismatch_count": case.get("mismatch_count", 0),
+				"mismatch_count": _case_mismatch_count(case),
 				"llvm_ir_path": case.get("llvm_ir_path"),
 				"config_path": case.get("config_path"),
 				"artifact_root": case.get("artifact_root"),
@@ -56,7 +82,7 @@ def _case_rows(cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def _metadata_rows(case: Dict[str, Any]) -> List[Dict[str, str]]:
 	runtime_ids = case.get("matched_runtime_ids") or {}
-	ignored = case.get("ignored_dynamic_only_blocks") or []
+	ignored = _case_dynamic_only_blocks(case)
 	return [
 		{"field": "Status", "value": str(case.get("status", ""))},
 		{"field": "Kernel function", "value": str(case.get("kernel_function", ""))},
@@ -82,10 +108,13 @@ def _category_options(cases: List[Dict[str, Any]]) -> List[Dict[str, str]]:
 def _detail_layout(case: Dict[str, Any]) -> List[Any]:
 	status = str(case.get("status", ""))
 	if status == "mismatched":
+		basic_blocks = case.get("basic_blocks", [])
+		mismatched_rows = [row for row in basic_blocks if _block_is_mismatch(row)]
+		mismatch_count = len(mismatched_rows) if basic_blocks else _case_mismatch_count(case)
 		symb_tool_messages = str(case.get("symb_tool_messages", "")).strip()
 		return [
 			html.Div(
-				f"{case.get('mismatch_count', 0)} mismatched basic block(s). "
+				f"{mismatch_count} mismatched basic block(s). "
 				"Use the table below to inspect raw symbolic and dynamic counts.",
 				className="muted",
 			),
@@ -100,7 +129,7 @@ def _detail_layout(case: Dict[str, Any]) -> List[Any]:
 					{"name": "dynamic", "id": "dynamic"},
 					{"name": "delta", "id": "delta"},
 				],
-				data=[row for row in case.get("basic_blocks", []) if not row.get("matches", True)],
+				data=mismatched_rows,
 				page_action="none",
 				sort_action="native",
 				filter_action="native",
@@ -145,12 +174,22 @@ def _detail_layout(case: Dict[str, Any]) -> List[Any]:
 			) if raw_symbolic_rows else html.Div(),
 		]
 
-	return [
+	comparable_count = sum(1 for row in case.get("basic_blocks", []) if _block_is_comparable(row))
+	dynamic_only_blocks = _case_dynamic_only_blocks(case)
+	children: List[Any] = [
 		html.Div(
-			f"All {len(case.get('basic_blocks', []))} basic blocks matched for this case.",
+			f"All {comparable_count} comparable basic blocks matched for this case.",
 			className="muted",
 		)
 	]
+	if dynamic_only_blocks:
+		children.append(
+			html.Div(
+				"Ignored dynamic-only block(s): " + ", ".join(dynamic_only_blocks),
+				className="muted",
+			)
+		)
+	return children
 
 
 def create_dash_app(payload: Dict[str, Any]) -> Dash:

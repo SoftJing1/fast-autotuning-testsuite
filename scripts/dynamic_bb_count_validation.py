@@ -877,6 +877,7 @@ def _build_case_record(
 		delta = None
 		if symb_value is not None and dynamic_value is not None:
 			delta = dynamic_value - symb_value
+		is_comparable = symb_value is not None and dynamic_value is not None
 		basic_blocks.append(
 			{
 				"name": block_name,
@@ -884,7 +885,10 @@ def _build_case_record(
 				"symb_viewer_raw": symb_raw_value,
 				"dynamic": dynamic_value,
 				"delta": delta,
-				"matches": symb_value == dynamic_value,
+				"matches": symb_value == dynamic_value if is_comparable else None,
+				"comparable": is_comparable,
+				"dynamic_only": dynamic_value is not None and symb_value is None,
+				"symbolic_only": symb_value is not None and dynamic_value is None,
 			}
 		)
 
@@ -903,7 +907,7 @@ def _build_case_record(
 		"kernel_function": comparison.get("kernel_function") if comparison else None,
 		"matched_runtime_ids": comparison.get("matched_runtime_ids") if comparison else None,
 		"ignored_dynamic_only_blocks": comparison.get("ignored_dynamic_only_blocks", []) if comparison else [],
-		"mismatch_count": sum(1 for item in basic_blocks if not item["matches"]),
+		"mismatch_count": sum(1 for item in basic_blocks if item["matches"] is False),
 		"basic_blocks": basic_blocks,
 	}
 
