@@ -49,6 +49,13 @@ except ModuleNotFoundError as exc:
 		raise
 	from internal.llvm_to_inst_count import extract_instruction_counts
 
+try:
+	from scripts.internal.runtime_opencl_ir import extract_opencl_runtime_ir
+except ModuleNotFoundError as exc:
+	if exc.name not in {"scripts", "scripts.internal", "scripts.internal.runtime_opencl_ir"}:
+		raise
+	from internal.runtime_opencl_ir import extract_opencl_runtime_ir
+
 DEFAULT_SEED = 42
 DEFAULT_EXPERIMENT_ROOT = "experiments"
 DEFAULT_DB_FILENAME = "experiments.db"
@@ -96,15 +103,25 @@ def hash_config(config_dict: Dict) -> str:
 	return hashlib.md5(config_str.encode()).hexdigest()[:16]
 
 
-def run_kernel(kernel_type: str, config_file: str, build_dir: str, timeout_sec: int = 60) -> Optional[float]:
+def run_kernel(
+	kernel_type: str,
+	config_file: str,
+	build_dir: str,
+	timeout_sec: int = 60,
+	dump_opencl_binary: Optional[str] = None,
+) -> Optional[float]:
 	"""Run kernel with configuration and return runtime in milliseconds."""
 	try:
 		exe_path = os.path.join(build_dir, kernel_type)
 		if not os.path.exists(exe_path):
 			return None
 
+		cmd = [exe_path, config_file]
+		if dump_opencl_binary:
+			cmd.extend(["--dump-opencl-binary", dump_opencl_binary])
+
 		result = subprocess.run(
-			[exe_path, config_file],
+			cmd,
 			capture_output=True,
 			text=True,
 			timeout=timeout_sec,
@@ -131,6 +148,7 @@ def run_kernel_average(
 	build_dir: str,
 	runs_per_config: int,
 	timeout_sec: int = 60,
+	dump_opencl_binary: Optional[str] = None,
 ) -> Optional[float]:
 	"""Run kernel multiple times and return average runtime in milliseconds."""
 	if runs_per_config <= 0:
@@ -138,7 +156,13 @@ def run_kernel_average(
 
 	runtimes: List[float] = []
 	for _ in range(runs_per_config):
-		runtime_ms = run_kernel(kernel_type, config_file, build_dir=build_dir, timeout_sec=timeout_sec)
+		runtime_ms = run_kernel(
+			kernel_type,
+			config_file,
+			build_dir=build_dir,
+			timeout_sec=timeout_sec,
+			dump_opencl_binary=dump_opencl_binary,
+		)
 		if runtime_ms is not None:
 			runtimes.append(runtime_ms)
 
@@ -146,6 +170,37 @@ def run_kernel_average(
 		return None
 
 	return sum(runtimes) / len(runtimes)
+
+
+def _kernel_size_string(kernel_type: str, config_dict: Dict) -> str:
+	if kernel_type == "gemm":
+		return f"{config_dict.get('M', 0)}x{config_dict.get('N', 0)}x{config_dict.get('K', 0)}"
+	return f"{config_dict.get('input_size_h', 0)}x{config_dict.get('input_size_w', 0)}"
+
+
+def runtime_ir_artifacts_from_dump(
+	kernel_type: str,
+	config_dict: Dict,
+	param_hash: str,
+	llvm_output_dir: Path,
+	opencl_binary_path: Path,
+) -> List[Dict[str, str]]:
+	"""Convert a host-dumped OpenCL binary into runtime LLVM IR artifact records."""
+	size_str = _kernel_size_string(kernel_type, config_dict)
+	output_ll = llvm_output_dir / f"{kernel_type}_{size_str}_{param_hash}_runtime.ll"
+	extract_opencl_runtime_ir(opencl_binary_path, output_ll)
+
+	artifacts: List[Dict[str, str]] = []
+	for spec in KERNEL_TEMPLATE_SPECS.get(kernel_type, []):
+		artifacts.append(
+			{
+				"template_name": spec["template_name"],
+				"kernel_function": spec["kernel_function"],
+				"llvm_ir_path": str(output_ll),
+				"opencl_binary_path": str(opencl_binary_path),
+			}
+		)
+	return artifacts
 
 
 def compile_to_llvm_ir(
@@ -213,11 +268,12 @@ def compile_to_llvm_ir(
 
 
 def _serialize_llvm_paths(llvm_paths: Sequence[str]) -> Optional[str]:
-	if not llvm_paths:
+	deduped = list(dict.fromkeys(llvm_paths))
+	if not deduped:
 		return None
-	if len(llvm_paths) == 1:
-		return llvm_paths[0]
-	return json.dumps(list(llvm_paths))
+	if len(deduped) == 1:
+		return deduped[0]
+	return json.dumps(deduped)
 
 
 def _parse_request(kernel_type: str, input_size: str, total_configs: str) -> ExperimentRequest:
@@ -397,19 +453,28 @@ def process_single_experiment(args: Tuple[int, str, str, str, str, str, int]) ->
 		with open(config_file) as f:
 			config = json.load(f)
 
+		param_hash = hash_config(config)
+		size_str = _kernel_size_string(kernel_type, config)
+		opencl_binary_path = Path(llvm_output_dir) / f"{kernel_type}_{size_str}_{param_hash}.opencl.bin"
 		runtime_ms = run_kernel_average(
 			kernel_type,
 			config_file,
 			build_dir=build_dir,
 			runs_per_config=runs_per_config,
+			dump_opencl_binary=str(opencl_binary_path),
 		)
 		if runtime_ms is None:
 			db.mark_failed(exp_id, f"Execution failed across {runs_per_config} run(s)")
 			db.close()
 			return (exp_id, False, "Execution failed")
 
-		param_hash = hash_config(config)
-		llvm_artifacts = compile_to_llvm_ir(kernel_type, config, param_hash, Path(llvm_output_dir))
+		llvm_artifacts = runtime_ir_artifacts_from_dump(
+			kernel_type,
+			config,
+			param_hash,
+			Path(llvm_output_dir),
+			opencl_binary_path,
+		)
 		db.mark_completed(
 			exp_id,
 			runtime_ms,

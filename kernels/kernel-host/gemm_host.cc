@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <string>
 #include <vector>
 
 #define CL_USE_DEPRECATED_OPENCL_1_2_APIS
@@ -196,6 +197,47 @@ std::string read_kernel_source(const char *filename) {
                      std::istreambuf_iterator<char>());
 }
 
+bool dump_opencl_program_binary(cl_program program, cl_device_id device,
+                                const std::string &output_path) {
+  size_t binary_size = 0;
+  cl_int err =
+      clGetProgramInfo(program, CL_PROGRAM_BINARY_SIZES, sizeof(binary_size),
+                       &binary_size, nullptr);
+  if (err != CL_SUCCESS || binary_size == 0) {
+    std::cerr << "Error querying OpenCL binary size: " << err << std::endl;
+    return false;
+  }
+
+  std::vector<unsigned char> binary(binary_size);
+  unsigned char *binary_ptr = binary.data();
+  err = clGetProgramInfo(program, CL_PROGRAM_BINARIES, sizeof(binary_ptr),
+                         &binary_ptr, nullptr);
+  if (err != CL_SUCCESS) {
+    std::cerr << "Error querying OpenCL binary: " << err << std::endl;
+    return false;
+  }
+
+  namespace fs = std::filesystem;
+  fs::path path(output_path);
+  if (path.has_parent_path()) {
+    fs::create_directories(path.parent_path());
+  }
+
+  std::ofstream out(output_path, std::ios::binary);
+  if (!out.is_open()) {
+    std::cerr << "Error: Could not open OpenCL binary output: " << output_path
+              << std::endl;
+    return false;
+  }
+  out.write(reinterpret_cast<const char *>(binary.data()), binary.size());
+  if (!out.good()) {
+    std::cerr << "Error writing OpenCL binary output: " << output_path
+              << std::endl;
+    return false;
+  }
+  return true;
+}
+
 // CPU reference: Matrix Multiplication C = A * B with intermediate result
 // reduction This mimics ATF's two-kernel pattern where intermediate results are
 // accumulated
@@ -355,10 +397,25 @@ int main(int argc, char *argv[]) {
   };
 
   // Load configuration from JSON file
-  std::string config_path = "config.json";
-  if (argc > 1) {
-    config_path = argv[1];
-  } else {
+  std::string config_path;
+  std::string dump_opencl_binary_path;
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--dump-opencl-binary") {
+      if (i + 1 >= argc) {
+        std::cerr << "Error: --dump-opencl-binary requires a path."
+                  << std::endl;
+        return EXIT_FAILURE;
+      }
+      dump_opencl_binary_path = argv[++i];
+    } else if (config_path.empty()) {
+      config_path = arg;
+    } else {
+      std::cerr << "Error: Unexpected argument: " << arg << std::endl;
+      return EXIT_FAILURE;
+    }
+  }
+  if (config_path.empty()) {
     std::cout << "No config file provided. Please provide a configuration JSON "
                  "file as an argument."
               << std::endl;
@@ -506,6 +563,11 @@ int main(int argc, char *argv[]) {
     clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log_size,
                           log.data(), nullptr);
     std::cerr << "Compilation error:\n" << log.data() << std::endl;
+    return EXIT_FAILURE;
+  }
+
+  if (!dump_opencl_binary_path.empty() &&
+      !dump_opencl_program_binary(program, device, dump_opencl_binary_path)) {
     return EXIT_FAILURE;
   }
 

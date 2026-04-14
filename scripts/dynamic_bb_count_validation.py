@@ -25,12 +25,17 @@ if str(ROOT) not in sys.path:
 
 from scripts.collect_tuning_performance_simple import (  # noqa: E402
 	ExperimentRequest,
-	compile_to_llvm_ir,
 	hash_config,
 	prepare_experiment_configs,
+	run_kernel,
+	runtime_ir_artifacts_from_dump,
 )
 
 LABEL_RE = re.compile(r"^([A-Za-z$._][-A-Za-z$._0-9]*|\d+):")
+RUNTIME_SPIR_TRIPLE_RE = re.compile(r'^target triple = "spir64-unknown-unknown"$', re.MULTILINE)
+RUNTIME_SPIR_DATALAYOUT_RE = re.compile(r'^target datalayout = ".*"$', re.MULTILINE)
+ADDRSPACE_PTR_RE = re.compile(r"ptr addrspace\(\d+\)")
+STANDALONE_ADDRSPACE_RE = re.compile(r"\saddrspace\(\d+\)")
 
 
 @dataclass(frozen=True)
@@ -52,6 +57,7 @@ class GeneratedArtifactPair:
 	root_dir: Path
 	llvm_ir_path: Path
 	config_path: Path
+	kernel_function: Optional[str]
 
 
 class SymbolicCountParseError(RuntimeError):
@@ -314,6 +320,23 @@ def _build_proxy_plan(llvm_text: str, config: Dict, explicit_function: Optional[
 	), instrumented_text
 
 
+def _normalize_runtime_ir_for_host_execution(llvm_text: str) -> str:
+	normalized = llvm_text
+	if RUNTIME_SPIR_TRIPLE_RE.search(normalized):
+		normalized = RUNTIME_SPIR_DATALAYOUT_RE.sub(
+			'target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"',
+			normalized,
+			count=1,
+		)
+		normalized = RUNTIME_SPIR_TRIPLE_RE.sub(
+			'target triple = "x86_64-unknown-linux-gnu"',
+			normalized,
+			count=1,
+		)
+	normalized = ADDRSPACE_PTR_RE.sub("ptr", normalized)
+	return STANDALONE_ADDRSPACE_RE.sub("", normalized)
+
+
 def _generate_driver_c(plan: ProxyBuildPlan) -> str:
 	arg_decls = []
 	call_args = []
@@ -441,7 +464,7 @@ def _dynamic_bb_counts(
 		driver_c = tmp / "driver.c"
 		exe_path = tmp / "bb_proxy.exe"
 
-		instrumented_ir.write_text(instrumented_text)
+		instrumented_ir.write_text(_normalize_runtime_ir_for_host_execution(instrumented_text))
 		driver_c.write_text(_generate_driver_c(plan))
 
 		_run(["clang", str(instrumented_ir), str(driver_c), "-O0", "-o", str(exe_path)], cwd=ROOT)
@@ -483,7 +506,7 @@ def _first_runtime_call_dims(llvm_text: str, function_name: str) -> Dict[str, in
 	lines = llvm_text.splitlines(keepends=True)
 	start, end, _ = _find_function_region(lines, function_name)
 	body_lines = lines[start + 1:end]
-	pattern = re.compile(r"call\s+\w+\s+@(?P<callee>[^(]+)\(i32(?:\s+\w+)*\s+(?P<dim>\d+)\)")
+	pattern = re.compile(r"call\s+.*?@(?P<callee>[^(]+)\(i32(?:\s+\w+)*\s+(?P<dim>\d+)\)")
 	dims: Dict[str, int] = {}
 	for line in body_lines:
 		match = pattern.search(line)
@@ -698,7 +721,7 @@ def _load_payload(path: Path) -> Dict[str, object]:
 	return json.loads(path.read_text())
 
 
-def _generate_random_artifact_pair(seed: int, validation_root: Path) -> GeneratedArtifactPair:
+def _generate_random_artifact_pair(seed: int, validation_root: Path, build_dir: str) -> GeneratedArtifactPair:
 	rng = random.Random(seed)
 	choices = [
 		ExperimentRequest("gaussian", (256, 256), 1),
@@ -719,12 +742,32 @@ def _generate_random_artifact_pair(seed: int, validation_root: Path) -> Generate
 		_, config_path = resolved[0]
 		config = _load_json(config_path)
 		param_hash = hash_config(config)
-		artifacts = compile_to_llvm_ir(_infer_kernel_type(config), config, param_hash, Path(tmpdir) / "llvm")
+		kernel_type = _infer_kernel_type(config)
+		size_tag = (
+			f"{config.get('M', 0)}x{config.get('N', 0)}x{config.get('K', 0)}"
+			if kernel_type == "gemm"
+			else f"{config.get('input_size_h', 0)}x{config.get('input_size_w', 0)}"
+		)
+		opencl_binary_path = Path(tmpdir) / "llvm" / f"{kernel_type}_{size_tag}_{param_hash}.opencl.bin"
+		runtime_ms = run_kernel(
+			kernel_type,
+			str(config_path),
+			build_dir=build_dir,
+			dump_opencl_binary=str(opencl_binary_path),
+		)
+		if runtime_ms is None:
+			raise RuntimeError("Failed to run host kernel and dump OpenCL binary")
+		artifacts = runtime_ir_artifacts_from_dump(
+			kernel_type,
+			config,
+			param_hash,
+			Path(tmpdir) / "llvm",
+			opencl_binary_path,
+		)
 		if not artifacts:
-			raise RuntimeError("Failed to compile generated config to LLVM IR")
+			raise RuntimeError("Failed to extract runtime LLVM IR for generated config")
 		chosen = rng.choice(artifacts)
 
-		kernel_type = _infer_kernel_type(config)
 		persist_dir = validation_root / f"seed_{seed:04d}_{kernel_type}"
 		if persist_dir.exists():
 			shutil.rmtree(persist_dir)
@@ -737,6 +780,7 @@ def _generate_random_artifact_pair(seed: int, validation_root: Path) -> Generate
 			root_dir=persist_dir,
 			llvm_ir_path=persist_llvm,
 			config_path=persist_config,
+			kernel_function=chosen.get("kernel_function"),
 		)
 
 
@@ -745,12 +789,13 @@ def _resolve_inputs(
 	config: Optional[str],
 	seed: int,
 	validation_root: Path,
+	build_dir: str,
 ) -> Tuple[Path, Path]:
 	if llvm_ir and config:
 		return Path(llvm_ir).resolve(), Path(config).resolve()
 	if llvm_ir or config:
 		raise ValueError("Pass both --llvm-ir and --config together, or omit both.")
-	artifacts = _generate_random_artifact_pair(seed, validation_root=validation_root)
+	artifacts = _generate_random_artifact_pair(seed, validation_root=validation_root, build_dir=build_dir)
 	return artifacts.llvm_ir_path, artifacts.config_path
 
 
@@ -759,7 +804,7 @@ def _classify_skip_reason(reason: str) -> str:
 		return "mismatched"
 	if "invalid literal for int()" in reason or "bvmul" in reason or "TR_den_" in reason:
 		return "symbolic"
-	if "SIGABRT" in reason or "died with <Signals." in reason:
+	if "SIGABRT" in reason or "died with <Signals." in reason or "host kernel" in reason:
 		return "crashed"
 	if "not found in PATH" in reason:
 		return "tooling"
@@ -904,13 +949,14 @@ def _run_random_validations(
 	total_cases: int,
 	start_seed: int,
 	validation_root: Path,
+	build_dir: str,
 	max_attempts: Optional[int] = None,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, str]], List[Dict[str, object]]]:
 	if total_cases <= 0:
 		raise ValueError("total_cases must be > 0")
 
 	if max_attempts is None:
-		max_attempts = max(total_cases * 10, total_cases + 10)
+		max_attempts = total_cases
 
 	results: List[Dict[str, object]] = []
 	skipped: List[Dict[str, str]] = []
@@ -918,12 +964,34 @@ def _run_random_validations(
 	current_seed = start_seed
 
 	while len(results) < total_cases and len(results) + len(skipped) < max_attempts:
-		artifacts = _generate_random_artifact_pair(seed=current_seed, validation_root=validation_root)
+		try:
+			artifacts = _generate_random_artifact_pair(
+				seed=current_seed,
+				validation_root=validation_root,
+				build_dir=build_dir,
+			)
+		except Exception as exc:
+			case_record = _build_case_record(
+				case_index=len(cases),
+				seed=current_seed,
+				reason=str(exc).splitlines()[0][:400],
+			)
+			cases.append(case_record)
+			skipped.append(
+				{
+					"seed": str(current_seed),
+					"reason": str(case_record.get("reason", ""))[:240],
+				}
+			)
+			current_seed += 1
+			continue
+
 		case_record = _run_validation_case(
 			case_index=len(cases),
 			seed=current_seed,
 			llvm_ir_path=artifacts.llvm_ir_path,
 			config_path=artifacts.config_path,
+			kernel_function=artifacts.kernel_function,
 			artifact_root=artifacts.root_dir,
 		)
 		cases.append(case_record)
@@ -1064,6 +1132,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 		default=30,
 		help="How many randomized validations to run when --llvm-ir/--config are omitted.",
 	)
+	parser.add_argument("--build-dir", default="build", help="Directory containing gaussian/gemm host executables.")
 	parser.add_argument("--host", default="127.0.0.1", help="Server host for the investigation UI")
 	parser.add_argument("--port", type=int, default=8766, help="Server port for the investigation UI")
 	parser.add_argument(
@@ -1115,6 +1184,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 					args.config,
 					args.seed,
 					validation_root=named_run_dir,
+					build_dir=args.build_dir,
 				)
 				case_record = _run_validation_case(
 					case_index=0,
@@ -1137,6 +1207,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 					total_cases=args.count,
 					start_seed=args.seed,
 					validation_root=named_run_dir,
+					build_dir=args.build_dir,
 				)
 				payload = _attach_run_metadata(
 					_build_visualization_payload(cases, _build_validation_summary(cases)),
@@ -1150,7 +1221,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 	elif args.llvm_ir or args.config:
 		single_case_root = _build_validation_run_dir(validation_root, args.seed, 1)
 		_ensure_visualization_launcher(single_case_root)
-		llvm_ir_path, config_path = _resolve_inputs(args.llvm_ir, args.config, args.seed, validation_root=single_case_root)
+		llvm_ir_path, config_path = _resolve_inputs(
+			args.llvm_ir,
+			args.config,
+			args.seed,
+			validation_root=single_case_root,
+			build_dir=args.build_dir,
+		)
 		case_record = _run_validation_case(
 			case_index=0,
 			seed=None,
@@ -1175,6 +1252,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 			total_cases=args.count,
 			start_seed=args.seed,
 			validation_root=run_validation_root,
+			build_dir=args.build_dir,
 		)
 		payload = _attach_run_metadata(
 			_build_visualization_payload(cases, _build_validation_summary(cases)),

@@ -162,6 +162,7 @@ def compile_opencl_to_llvm(
 	template_path: str,
 	params_path: str,
 	output_ll_path: str,
+	target_triple: str | None = None,
 ) -> bool:
 	"""Compile OpenCL template + params to LLVM IR without merging files.
 
@@ -216,6 +217,8 @@ def compile_opencl_to_llvm(
 			template_path,
 			'-o', output_ll_path
 		]
+		if target_triple:
+			cmd[1:1] = ['-target', target_triple]
 
 		try:
 			result = subprocess.run(cmd, capture_output=True, text=True, check=False)

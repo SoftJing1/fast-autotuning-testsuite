@@ -6,3 +6,5 @@ test_results.json
 experiments/
 .venv/
 validation/
+.codex
+notes/
