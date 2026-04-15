@@ -243,7 +243,7 @@ class ExperimentDB:
 			cursor = self._execute(
 				"""
 				UPDATE experiments
-				SET status = 'completed', runtime_ms = ?, llvm_ir_path = ?
+				SET status = 'completed', runtime_ms = ?, llvm_ir_path = ?, error_msg = NULL
 				WHERE exp_id = ?
 				""",
 				(runtime_ms, llvm_ir_path, exp_id),
@@ -265,6 +265,21 @@ class ExperimentDB:
 			return cursor.rowcount > 0
 		except sqlite3.Error as e:
 			raise RuntimeError(f"Failed to mark experiment as failed: {e}")
+
+	def record_error_message(self, exp_id: int, error_msg: str) -> bool:
+		"""Attach a non-fatal diagnostic message to an experiment row."""
+		try:
+			cursor = self._execute(
+				"""
+				UPDATE experiments
+				SET error_msg = ?
+				WHERE exp_id = ?
+				""",
+				(error_msg, exp_id),
+			)
+			return cursor.rowcount > 0
+		except sqlite3.Error as e:
+			raise RuntimeError(f"Failed to record experiment diagnostic: {e}")
 
 	def get_pending_experiments(self, limit: Optional[int] = None) -> List[ExperimentResult]:
 		try:

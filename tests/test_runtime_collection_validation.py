@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
 	sys.path.insert(0, str(ROOT))
 
-from scripts.collect_tuning_performance_simple import run_kernel_average
+from scripts.collect_tuning_performance_simple import KernelRunResult, run_kernel, run_kernel_average
 
 
 def _build_dir() -> Path:
@@ -104,14 +104,17 @@ def test_collect_db_runtime_matches_host_rerun(tmp_path, kernel_type: str, input
 			build_dir=str(_build_dir()),
 			runs_per_config=runs_per_config,
 		)
-		if rerun_avg is None:
-			pytest.skip("Host rerun failed for a stored configuration in this environment")
+		if not rerun_avg.success or rerun_avg.runtime_ms is None:
+			pytest.skip(
+				"Host rerun failed for a stored configuration in this environment: "
+				f"{rerun_avg.error_summary()}"
+			)
 
-		diff = abs(rerun_avg - stored_runtime)
+		diff = abs(rerun_avg.runtime_ms - stored_runtime)
 		rel_diff = diff / max(abs(stored_runtime), 1e-9)
 		assert rel_diff <= 0.35 or diff <= 2.0, (
 			f"Runtime mismatch too high for exp_id={row['exp_id']}: "
-			f"stored={stored_runtime:.6f}ms rerun={rerun_avg:.6f}ms "
+			f"stored={stored_runtime:.6f}ms rerun={rerun_avg.runtime_ms:.6f}ms "
 			f"abs_diff={diff:.6f}ms rel_diff={rel_diff:.4f}"
 		)
 
@@ -121,9 +124,9 @@ def test_run_kernel_average_uses_multiple_runs(monkeypatch):
 	calls = []
 	values = [1.0, 2.0, 3.0]
 
-	def fake_run_kernel(kernel_type: str, config_file: str, build_dir: str, timeout_sec: int = 60):
-		calls.append((kernel_type, config_file, build_dir, timeout_sec))
-		return values[len(calls) - 1]
+	def fake_run_kernel(kernel_type: str, config_file: str, build_dir: str, dump_opencl_binary=None):
+		calls.append((kernel_type, config_file, build_dir, dump_opencl_binary))
+		return KernelRunResult(runtime_ms=values[len(calls) - 1])
 
 	module = sys.modules["scripts.collect_tuning_performance_simple"]
 	monkeypatch.setattr(module, "run_kernel", fake_run_kernel)
@@ -136,4 +139,32 @@ def test_run_kernel_average_uses_multiple_runs(monkeypatch):
 	)
 
 	assert len(calls) == 3
-	assert avg == pytest.approx(2.0)
+	assert avg.runtime_ms == pytest.approx(2.0)
+
+
+def test_run_kernel_reports_missing_executable(tmp_path):
+	"""Detailed kernel runs should preserve the reason a launch failed."""
+	config_path = tmp_path / "config.json"
+	config_path.write_text("{}")
+
+	result = run_kernel(
+		kernel_type="gemm",
+		config_file=str(config_path),
+		build_dir=str(tmp_path / "missing_build"),
+	)
+
+	assert not result.success
+	assert result.runtime_ms is None
+	assert "Executable not found" in result.error_msg
+
+	average = run_kernel_average(
+		kernel_type="gemm",
+		config_file=str(config_path),
+		build_dir=str(tmp_path / "missing_build"),
+		runs_per_config=2,
+	)
+
+	assert not average.success
+	assert average.successful_runs == 0
+	assert len(average.errors) == 2
+	assert "Executable not found" in average.error_summary()

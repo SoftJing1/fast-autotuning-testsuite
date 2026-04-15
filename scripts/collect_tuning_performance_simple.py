@@ -61,6 +61,7 @@ DEFAULT_EXPERIMENT_ROOT = "experiments"
 DEFAULT_DB_FILENAME = "experiments.db"
 DEFAULT_BUILD_DIR = "build"
 DEFAULT_RUNS_PER_CONFIG = 3
+MAX_ERROR_MESSAGE_LEN = 4000
 
 KERNEL_TEMPLATE_SPECS = {
 	"gemm": [
@@ -97,49 +98,147 @@ class ExperimentRequest:
 		return "x".join(str(v) for v in self.input_size)
 
 
+@dataclass(frozen=True)
+class KernelRunResult:
+	"""Detailed outcome from one host-kernel invocation."""
+	runtime_ms: Optional[float]
+	error_msg: str = ""
+	returncode: Optional[int] = None
+	stdout_tail: str = ""
+	stderr_tail: str = ""
+
+	@property
+	def success(self) -> bool:
+		return self.runtime_ms is not None and not self.error_msg
+
+
+@dataclass(frozen=True)
+class KernelAverageResult:
+	"""Detailed outcome from repeated host-kernel invocations."""
+	runtime_ms: Optional[float]
+	successful_runs: int
+	attempted_runs: int
+	errors: Tuple[str, ...] = ()
+
+	@property
+	def success(self) -> bool:
+		return self.runtime_ms is not None
+
+	def error_summary(self) -> str:
+		if not self.errors:
+			return "no errors"
+		deduped = list(dict.fromkeys(self.errors))
+		return "; ".join(deduped)
+
+
+@dataclass(frozen=True)
+class SchedulingResult:
+	"""Experiment work items plus count of configs that could not be scheduled."""
+	experiments: List[Tuple[int, str, str, str, str, str, int]]
+	error_count: int
+
+
+@dataclass(frozen=True)
+class RuntimeIRResult:
+	"""Runtime IR extraction result for one experiment."""
+	artifacts: List[Dict[str, str]]
+	error_msg: Optional[str] = None
+
+	@property
+	def success(self) -> bool:
+		return self.error_msg is None and bool(self.artifacts)
+
+
 def hash_config(config_dict: Dict) -> str:
 	"""Generate deterministic hash of configuration."""
 	config_str = json.dumps(config_dict, sort_keys=True)
 	return hashlib.md5(config_str.encode()).hexdigest()[:16]
 
 
+def _tail_text(value: object, limit: int = 1000) -> str:
+	if value is None:
+		return ""
+	if isinstance(value, bytes):
+		text = value.decode("utf-8", errors="replace")
+	else:
+		text = str(value)
+	text = text.strip()
+	if len(text) <= limit:
+		return text
+	return text[-limit:]
+
+
+def _truncate_error(message: str, limit: int = MAX_ERROR_MESSAGE_LEN) -> str:
+	message = message.strip()
+	if len(message) <= limit:
+		return message
+	return message[: limit - 3] + "..."
+
+
 def run_kernel(
 	kernel_type: str,
 	config_file: str,
 	build_dir: str,
-	timeout_sec: int = 60,
 	dump_opencl_binary: Optional[str] = None,
-) -> Optional[float]:
-	"""Run kernel with configuration and return runtime in milliseconds."""
+) -> KernelRunResult:
+	"""Run kernel with configuration and return a detailed outcome."""
 	try:
 		exe_path = os.path.join(build_dir, kernel_type)
 		if not os.path.exists(exe_path):
-			return None
+			return KernelRunResult(
+				runtime_ms=None,
+				error_msg=f"Executable not found: {exe_path}",
+			)
+
+		if not os.path.exists(config_file):
+			return KernelRunResult(
+				runtime_ms=None,
+				error_msg=f"Config file not found: {config_file}",
+			)
 
 		cmd = [exe_path, config_file]
 		if dump_opencl_binary:
+			Path(dump_opencl_binary).parent.mkdir(parents=True, exist_ok=True)
 			cmd.extend(["--dump-opencl-binary", dump_opencl_binary])
 
 		result = subprocess.run(
 			cmd,
 			capture_output=True,
 			text=True,
-			timeout=timeout_sec,
 		)
 
 		if result.returncode != 0:
-			return None
+			return KernelRunResult(
+				runtime_ms=None,
+				error_msg=_truncate_error(
+					f"Kernel command failed with exit code {result.returncode}: {' '.join(cmd)}"
+				),
+				returncode=result.returncode,
+				stdout_tail=_tail_text(result.stdout),
+				stderr_tail=_tail_text(result.stderr),
+			)
 
 		match = re.search(r"Device kernel execution time:\s*(\d+\.?\d*)\s*ms", result.stdout, re.IGNORECASE)
 		if match:
-			return float(match.group(1))
+			return KernelRunResult(
+				runtime_ms=float(match.group(1)),
+				returncode=result.returncode,
+				stdout_tail=_tail_text(result.stdout),
+				stderr_tail=_tail_text(result.stderr),
+			)
 
-		raise ValueError(f"Runtime not found in output: {result.stdout}")
+		return KernelRunResult(
+			runtime_ms=None,
+			error_msg="Runtime marker not found in kernel stdout",
+			returncode=result.returncode,
+			stdout_tail=_tail_text(result.stdout),
+			stderr_tail=_tail_text(result.stderr),
+		)
 
-	except subprocess.TimeoutExpired:
-		return None
-	except Exception:
-		return None
+	except OSError as exc:
+		return KernelRunResult(runtime_ms=None, error_msg=f"Kernel launch failed: {exc}")
+	except Exception as exc:
+		return KernelRunResult(runtime_ms=None, error_msg=f"Unexpected kernel error: {exc}")
 
 
 def run_kernel_average(
@@ -147,29 +246,46 @@ def run_kernel_average(
 	config_file: str,
 	build_dir: str,
 	runs_per_config: int,
-	timeout_sec: int = 60,
 	dump_opencl_binary: Optional[str] = None,
-) -> Optional[float]:
-	"""Run kernel multiple times and return average runtime in milliseconds."""
+) -> KernelAverageResult:
+	"""Run kernel multiple times and return a detailed average-runtime outcome."""
 	if runs_per_config <= 0:
 		raise ValueError("runs_per_config must be > 0")
 
 	runtimes: List[float] = []
-	for _ in range(runs_per_config):
-		runtime_ms = run_kernel(
+	errors: List[str] = []
+	for run_index in range(1, runs_per_config + 1):
+		result = run_kernel(
 			kernel_type,
 			config_file,
 			build_dir=build_dir,
-			timeout_sec=timeout_sec,
 			dump_opencl_binary=dump_opencl_binary,
 		)
-		if runtime_ms is not None:
-			runtimes.append(runtime_ms)
+		if result.success and result.runtime_ms is not None:
+			runtimes.append(result.runtime_ms)
+			continue
+
+		details = result.error_msg or "unknown kernel failure"
+		if result.stderr_tail:
+			details = f"{details}; stderr: {result.stderr_tail}"
+		elif result.stdout_tail:
+			details = f"{details}; stdout: {result.stdout_tail}"
+		errors.append(_truncate_error(f"run {run_index}: {details}"))
 
 	if not runtimes:
-		return None
+		return KernelAverageResult(
+			runtime_ms=None,
+			successful_runs=0,
+			attempted_runs=runs_per_config,
+			errors=tuple(errors),
+		)
 
-	return sum(runtimes) / len(runtimes)
+	return KernelAverageResult(
+		runtime_ms=sum(runtimes) / len(runtimes),
+		successful_runs=len(runtimes),
+		attempted_runs=runs_per_config,
+		errors=tuple(errors),
+	)
 
 
 def _kernel_size_string(kernel_type: str, config_dict: Dict) -> str:
@@ -432,86 +548,283 @@ def prepare_experiment_configs(
 
 	for request in requests:
 		config_dir = _request_output_dir(configs_root, request)
-		request_files = _generate_request_configs(
-			request=request,
-			config_dir=config_dir,
-			generator_module=modules[request.kernel_type],
-			device_type=device_type,
-			seed=seed,
-		)
+		try:
+			request_files = _generate_request_configs(
+				request=request,
+				config_dir=config_dir,
+				generator_module=modules[request.kernel_type],
+				device_type=device_type,
+				seed=seed,
+			)
+		except Exception as exc:
+			print(
+				f"Warning: failed to prepare configs for "
+				f"{request.kernel_type}/{request.size_string}: {_format_exception(exc)}",
+				file=sys.stderr,
+			)
+			continue
 		resolved.extend((request, path) for path in request_files)
 
 	return resolved
 
 
-def process_single_experiment(args: Tuple[int, str, str, str, str, str, int]) -> Tuple[int, bool, str]:
-	"""Process single experiment in worker process."""
-	exp_id, kernel_type, config_file, db_path, llvm_output_dir, build_dir, runs_per_config = args
+def _format_exception(exc: BaseException) -> str:
+	return _truncate_error(f"{type(exc).__name__}: {exc}")
 
+
+def _schedule_single_experiment(
+	db: ExperimentDB,
+	request: ExperimentRequest,
+	config_file: Path,
+	db_path: Path,
+	llvm_root: Path,
+	build_dir: str,
+	runs_per_config: int,
+	resume: bool,
+) -> Optional[Tuple[int, str, str, str, str, str, int]]:
+	with open(config_file) as f:
+		config = json.load(f)
+
+	param_hash = hash_config(config)
+	exp_id = db.add_experiment(
+		kernel_type=request.kernel_type,
+		input_size=request.size_string,
+		param_hash=param_hash,
+		config_dict=config,
+		skip_if_exists=resume,
+	)
+
+	if exp_id is None:
+		return None
+
+	return (
+		exp_id,
+		request.kernel_type,
+		str(config_file),
+		str(db_path),
+		str(llvm_root),
+		build_dir,
+		runs_per_config,
+	)
+
+
+def schedule_experiment_work(
+	resolved_configs: Sequence[Tuple[ExperimentRequest, Path]],
+	db_path: Path,
+	llvm_root: Path,
+	build_dir: str,
+	runs_per_config: int,
+	resume: bool,
+) -> SchedulingResult:
+	"""Create DB rows and worker arguments for configs that are ready to run."""
+	experiments: List[Tuple[int, str, str, str, str, str, int]] = []
+	error_count = 0
+
+	with ExperimentDB(str(db_path)) as db:
+		for request, config_file in resolved_configs:
+			try:
+				work_item = _schedule_single_experiment(
+					db=db,
+					request=request,
+					config_file=config_file,
+					db_path=db_path,
+					llvm_root=llvm_root,
+					build_dir=build_dir,
+					runs_per_config=runs_per_config,
+					resume=resume,
+				)
+			except Exception as exc:
+				error_count += 1
+				print(
+					f"Warning: failed to schedule config {config_file}: {_format_exception(exc)}",
+					file=sys.stderr,
+				)
+				continue
+
+			if work_item is not None:
+				experiments.append(work_item)
+
+	return SchedulingResult(experiments=experiments, error_count=error_count)
+
+
+def _worker_failure(db: ExperimentDB, exp_id: int, error_msg: str) -> Tuple[int, bool, str]:
+	error_msg = _truncate_error(error_msg)
+	db.mark_failed(exp_id, error_msg)
+	return (exp_id, False, error_msg)
+
+
+def _mark_failed_from_exception(db_path: str, exp_id: int, error_msg: str) -> None:
 	try:
-		db = ExperimentDB(db_path)
-		with open(config_file) as f:
-			config = json.load(f)
+		with ExperimentDB(db_path) as db:
+			db.mark_failed(exp_id, error_msg)
+	except Exception:
+		pass
 
-		param_hash = hash_config(config)
-		size_str = _kernel_size_string(kernel_type, config)
-		opencl_binary_path = Path(llvm_output_dir) / f"{kernel_type}_{size_str}_{param_hash}.opencl.bin"
-		runtime_ms = run_kernel_average(
-			kernel_type,
-			config_file,
-			build_dir=build_dir,
-			runs_per_config=runs_per_config,
-			dump_opencl_binary=str(opencl_binary_path),
-		)
-		if runtime_ms is None:
-			db.mark_failed(exp_id, f"Execution failed across {runs_per_config} run(s)")
-			db.close()
-			return (exp_id, False, "Execution failed")
 
-		llvm_artifacts = runtime_ir_artifacts_from_dump(
+def _extract_runtime_ir_result(
+	kernel_type: str,
+	config: Dict,
+	param_hash: str,
+	llvm_output_dir: Path,
+	opencl_binary_path: Path,
+) -> RuntimeIRResult:
+	try:
+		artifacts = runtime_ir_artifacts_from_dump(
 			kernel_type,
 			config,
 			param_hash,
-			Path(llvm_output_dir),
+			llvm_output_dir,
 			opencl_binary_path,
 		)
-		db.mark_completed(
-			exp_id,
-			runtime_ms,
-			_serialize_llvm_paths([artifact["llvm_ir_path"] for artifact in llvm_artifacts]),
+	except Exception as exc:
+		return RuntimeIRResult(
+			artifacts=[],
+			error_msg=_truncate_error(f"Runtime LLVM IR extraction failed: {_format_exception(exc)}"),
 		)
 
-		for artifact in llvm_artifacts:
-			try:
-				inst_result = extract_instruction_counts(
-					artifact["llvm_ir_path"],
-					kernel_function=artifact["kernel_function"],
-				)
-				db.upsert_llvm_instruction_counts(
-					exp_id=exp_id,
-					template_name=artifact["template_name"],
-					kernel_function=artifact["kernel_function"],
-					llvm_ir_path=artifact["llvm_ir_path"],
-					bb_counts=inst_result.bb_counts,
-					bb_instruction_counts=inst_result.bb_instruction_counts,
-					total_instruction_counts=inst_result.total_instruction_counts,
-				)
-			except Exception as e:
-				print(
-					f"Warning: failed to extract/store LLVM instruction counts for exp_id={exp_id}, "
-					f"template={artifact['template_name']}: {e}",
-					file=sys.stderr,
-				)
-		db.close()
-		return (exp_id, True, "")
-	except Exception as e:
+	if not artifacts:
+		return RuntimeIRResult(
+			artifacts=[],
+			error_msg="Runtime LLVM IR extraction produced no artifacts",
+		)
+
+	return RuntimeIRResult(artifacts=artifacts)
+
+
+def _runtime_diagnostics(runtime_result: KernelAverageResult) -> List[str]:
+	if not runtime_result.errors:
+		return []
+	return [
+		_truncate_error(
+			f"Kernel produced {runtime_result.successful_runs}/"
+			f"{runtime_result.attempted_runs} successful run(s); ignored failed runs: "
+			f"{runtime_result.error_summary()}"
+		)
+	]
+
+
+def _store_symbolic_instruction_counts(
+	db: ExperimentDB,
+	exp_id: int,
+	llvm_artifacts: Sequence[Dict[str, str]],
+) -> List[str]:
+	errors: List[str] = []
+	for artifact in llvm_artifacts:
 		try:
-			db = ExperimentDB(db_path)
-			db.mark_failed(exp_id, str(e))
-			db.close()
-		except Exception:
-			pass
-		return (exp_id, False, str(e))
+			inst_result = extract_instruction_counts(
+				artifact["llvm_ir_path"],
+				kernel_function=artifact["kernel_function"],
+			)
+			db.upsert_llvm_instruction_counts(
+				exp_id=exp_id,
+				template_name=artifact["template_name"],
+				kernel_function=artifact["kernel_function"],
+				llvm_ir_path=artifact["llvm_ir_path"],
+				bb_counts=inst_result.bb_counts,
+				bb_instruction_counts=inst_result.bb_instruction_counts,
+				total_instruction_counts=inst_result.total_instruction_counts,
+			)
+		except Exception as exc:
+			errors.append(
+				_truncate_error(
+					f"template={artifact['template_name']}, "
+					f"kernel_function={artifact['kernel_function']}: {_format_exception(exc)}"
+				)
+			)
+	return errors
+
+
+def _symbolic_diagnostics(symbolic_errors: Sequence[str], artifact_count: int) -> List[str]:
+	if not symbolic_errors:
+		return []
+	return [
+		_truncate_error(
+			"Symbolic instruction-count extraction failed for "
+			f"{len(symbolic_errors)}/{artifact_count} artifact(s): "
+			+ " | ".join(symbolic_errors)
+		)
+	]
+
+
+def _record_worker_diagnostics(db: ExperimentDB, exp_id: int, diagnostics: Sequence[str]) -> None:
+	if not diagnostics:
+		return
+
+	warning = _truncate_error(" ".join(diagnostics))
+	try:
+		db.record_error_message(exp_id, warning)
+	except Exception as exc:
+		print(
+			f"Warning: failed to store diagnostic for exp_id={exp_id}: {_format_exception(exc)}",
+			file=sys.stderr,
+		)
+	print(f"Warning: exp_id={exp_id}: {warning}", file=sys.stderr)
+
+
+def process_single_experiment(args: Tuple[int, str, str, str, str, str, int]) -> Tuple[int, bool, str]:
+	"""Process single experiment in worker process."""
+	(
+		exp_id,
+		kernel_type,
+		config_file,
+		db_path,
+		llvm_output_dir,
+		build_dir,
+		runs_per_config,
+	) = args
+
+	try:
+		with ExperimentDB(db_path) as db:
+			with open(config_file) as f:
+				config = json.load(f)
+
+			param_hash = hash_config(config)
+			size_str = _kernel_size_string(kernel_type, config)
+			opencl_binary_path = Path(llvm_output_dir) / f"{kernel_type}_{size_str}_{param_hash}.opencl.bin"
+
+			runtime_result = run_kernel_average(
+				kernel_type,
+				config_file,
+				build_dir=build_dir,
+				runs_per_config=runs_per_config,
+				dump_opencl_binary=str(opencl_binary_path),
+			)
+			if not runtime_result.success or runtime_result.runtime_ms is None:
+				return _worker_failure(
+					db,
+					exp_id,
+					f"Execution failed across {runs_per_config} run(s): "
+					f"{runtime_result.error_summary()}",
+				)
+
+			ir_result = _extract_runtime_ir_result(
+				kernel_type,
+				config,
+				param_hash,
+				Path(llvm_output_dir),
+				opencl_binary_path,
+			)
+			if not ir_result.success:
+				return _worker_failure(db, exp_id, ir_result.error_msg or "Runtime LLVM IR extraction failed")
+
+			db.mark_completed(
+				exp_id,
+				runtime_result.runtime_ms,
+				_serialize_llvm_paths([artifact["llvm_ir_path"] for artifact in ir_result.artifacts]),
+			)
+
+			symbolic_errors = _store_symbolic_instruction_counts(db, exp_id, ir_result.artifacts)
+			diagnostics = (
+				_runtime_diagnostics(runtime_result)
+				+ _symbolic_diagnostics(symbolic_errors, len(ir_result.artifacts))
+			)
+			_record_worker_diagnostics(db, exp_id, diagnostics)
+
+		return (exp_id, True, "")
+	except Exception as exc:
+		error_msg = _format_exception(exc)
+		_mark_failed_from_exception(db_path, exp_id, error_msg)
+		return (exp_id, False, error_msg)
 
 
 def _build_experiment_directory(root_dir: str, experiment_name: Optional[str], resume: bool) -> Path:
@@ -577,6 +890,8 @@ def collect_experiments(
 	"""Main collection pipeline from request tuples."""
 	if num_workers is None:
 		num_workers = max(1, cpu_count() - 1)
+	if num_workers <= 0:
+		raise ValueError("num_workers must be > 0")
 	if runs_per_config <= 0:
 		raise ValueError("runs_per_config must be > 0")
 
@@ -626,54 +941,37 @@ def collect_experiments(
 			seed=seed,
 		)
 
-		db = ExperimentDB(str(db_path))
-		experiments: List[Tuple[int, str, str, str, str, str, int]] = []
-
-		for request, config_file in resolved_configs:
-			with open(config_file) as f:
-				config = json.load(f)
-
-			param_hash = hash_config(config)
-			exp_id = db.add_experiment(
-				kernel_type=request.kernel_type,
-				input_size=request.size_string,
-				param_hash=param_hash,
-				config_dict=config,
-				skip_if_exists=resume,
-			)
-
-			if exp_id is not None:
-				experiments.append(
-					(
-						exp_id,
-						request.kernel_type,
-						str(config_file),
-						str(db_path),
-						str(llvm_root),
-						build_dir,
-						runs_per_config,
-					)
-				)
-
-		db.close()
+		scheduling = schedule_experiment_work(
+			resolved_configs=resolved_configs,
+			db_path=db_path,
+			llvm_root=llvm_root,
+			build_dir=build_dir,
+			runs_per_config=runs_per_config,
+			resume=resume,
+		)
+		experiments = scheduling.experiments
 
 		if not experiments:
 			print("No new experiments to process")
-			return 0
+			return 1 if scheduling.error_count or not resolved_configs else 0
 
 		print(f"\nProcessing {len(experiments)} experiments with {num_workers} workers...")
 		print("=" * 70)
 
 		completed = 0
 		failed = 0
-		with Pool(num_workers) as pool:
-			for i, (_, success, _) in enumerate(pool.imap_unordered(process_single_experiment, experiments)):
-				if success:
-					completed += 1
-				else:
-					failed += 1
-				if (i + 1) % 10 == 0 or (i + 1) == len(experiments):
-					print(f"  [{i+1}/{len(experiments)}] {completed} completed, {failed} failed")
+		try:
+			with Pool(num_workers) as pool:
+				for i, (_, success, _) in enumerate(pool.imap_unordered(process_single_experiment, experiments)):
+					if success:
+						completed += 1
+					else:
+						failed += 1
+					if (i + 1) % 10 == 0 or (i + 1) == len(experiments):
+						print(f"  [{i+1}/{len(experiments)}] {completed} completed, {failed} failed")
+		except Exception as exc:
+			print(f"Worker pool error: {_format_exception(exc)}", file=sys.stderr)
+			return 1
 
 		db = ExperimentDB(str(db_path))
 		stats = db.get_statistics()
@@ -689,7 +987,7 @@ def collect_experiments(
 			print(f"  Avg runtime: {stats['avg_runtime_ms']:.3f} ms")
 		print("=" * 70)
 
-		return 0 if failed == 0 else 1
+		return 0 if failed == 0 and scheduling.error_count == 0 else 1
 	except Exception as e:
 		print(f"Collection error: {e}", file=sys.stderr)
 		return 1
@@ -807,6 +1105,9 @@ def main() -> int:
 
 	if args.runs_per_config <= 0:
 		print("Argument error: --runs-per-config must be > 0", file=sys.stderr)
+		return 3
+	if args.workers is not None and args.workers <= 0:
+		print("Argument error: --workers must be > 0", file=sys.stderr)
 		return 3
 
 	try:

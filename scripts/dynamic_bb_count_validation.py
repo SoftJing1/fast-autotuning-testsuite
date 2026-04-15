@@ -30,6 +30,10 @@ from scripts.collect_tuning_performance_simple import (  # noqa: E402
 	run_kernel,
 	runtime_ir_artifacts_from_dump,
 )
+from scripts.internal.llvm_to_inst_count import (  # noqa: E402
+	_build_symb_substitutions as _shared_build_symb_substitutions,
+	_parse_symb_count as _shared_parse_symb_count,
+)
 
 LABEL_RE = re.compile(r"^([A-Za-z$._][-A-Za-z$._0-9]*|\d+):")
 RUNTIME_SPIR_TRIPLE_RE = re.compile(r'^target triple = "spir64-unknown-unknown"$', re.MULTILINE)
@@ -495,27 +499,7 @@ def _dynamic_bb_counts(
 
 
 def _parse_symb_count(raw_count: str) -> int:
-	if raw_count.startswith("#x"):
-		return int(raw_count[2:], 16)
-	if raw_count.startswith("0x"):
-		return int(raw_count, 16)
-	return int(raw_count)
-
-
-def _first_runtime_call_dims(llvm_text: str, function_name: str) -> Dict[str, int]:
-	lines = llvm_text.splitlines(keepends=True)
-	start, end, _ = _find_function_region(lines, function_name)
-	body_lines = lines[start + 1:end]
-	pattern = re.compile(r"call\s+.*?@(?P<callee>[^(]+)\(i32(?:\s+\w+)*\s+(?P<dim>\d+)\)")
-	dims: Dict[str, int] = {}
-	for line in body_lines:
-		match = pattern.search(line)
-		if not match:
-			continue
-		callee = match.group("callee")
-		if callee in {"_Z12get_group_idj", "_Z12get_local_idj"} and callee not in dims:
-			dims[callee] = int(match.group("dim"))
-	return dims
+	return _shared_parse_symb_count(raw_count)
 
 
 def _build_symb_substitutions(
@@ -523,17 +507,7 @@ def _build_symb_substitutions(
 	function_name: str,
 	runtime_ids: RuntimeIdSelection,
 ) -> Dict[str, int]:
-	call_dims = _first_runtime_call_dims(llvm_text, function_name)
-	substitutions: Dict[str, int] = {}
-	for callee, dim in call_dims.items():
-		if callee == "_Z12get_group_idj":
-			value = int(runtime_ids.group_ids[dim])
-		elif callee == "_Z12get_local_idj":
-			value = int(runtime_ids.local_ids[dim])
-		else:
-			continue
-		substitutions[f"call_ret_{callee}"] = value
-	return substitutions
+	return _shared_build_symb_substitutions(llvm_text, function_name, runtime_ids)
 
 
 def _symb_viewer_bb_counts(
@@ -749,14 +723,16 @@ def _generate_random_artifact_pair(seed: int, validation_root: Path, build_dir: 
 			else f"{config.get('input_size_h', 0)}x{config.get('input_size_w', 0)}"
 		)
 		opencl_binary_path = Path(tmpdir) / "llvm" / f"{kernel_type}_{size_tag}_{param_hash}.opencl.bin"
-		runtime_ms = run_kernel(
+		runtime_result = run_kernel(
 			kernel_type,
 			str(config_path),
 			build_dir=build_dir,
 			dump_opencl_binary=str(opencl_binary_path),
 		)
-		if runtime_ms is None:
-			raise RuntimeError("Failed to run host kernel and dump OpenCL binary")
+		if not runtime_result.success:
+			raise RuntimeError(
+				f"Failed to run host kernel and dump OpenCL binary: {runtime_result.error_msg}"
+			)
 		artifacts = runtime_ir_artifacts_from_dump(
 			kernel_type,
 			config,

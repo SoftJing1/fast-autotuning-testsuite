@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -39,6 +40,27 @@ class InstCountResult:
 		}
 
 
+@dataclass(frozen=True)
+class RuntimeIdSelection:
+	group_ids: Tuple[int, int, int]
+	local_ids: Tuple[int, int, int]
+
+
+class SymbolicCountParseError(RuntimeError):
+	def __init__(self, raw_counts: Dict[str, str]):
+		self.raw_counts = raw_counts
+		preview = ", ".join(f"{name}={value}" for name, value in list(raw_counts.items())[:5])
+		super().__init__(f"Non-integer symb-viewer basic block counts: {preview}")
+
+
+# The validation proxy compares symb-viewer against the first candidate runtime
+# ID selection, which is all zeroes for every active group/local dimension.
+DEFAULT_RUNTIME_IDS = RuntimeIdSelection(
+	group_ids=(0, 0, 0),
+	local_ids=(0, 0, 0),
+)
+
+
 def _resolve_kernel_function(llvm_ir_path: Path, kernel_function: Optional[str]) -> str:
 	if kernel_function:
 		return kernel_function
@@ -55,12 +77,65 @@ def _resolve_kernel_function(llvm_ir_path: Path, kernel_function: Optional[str])
 	)
 
 
-def _parse_hex_count(value: str) -> int:
+def _parse_symb_count(value: str) -> int:
 	if value.startswith("#x"):
 		return int(value[2:], 16)
 	if value.startswith("0x"):
 		return int(value, 16)
-	return -1
+	return int(value)
+
+
+def _find_function_region(lines: List[str], function_name: str) -> Tuple[int, int, str]:
+	start = -1
+	header = ""
+	pattern = re.compile(rf"^define\s+.*@{re.escape(function_name)}\(")
+	for i, line in enumerate(lines):
+		if pattern.search(line):
+			start = i
+			header = line
+			break
+	if start < 0:
+		raise ValueError(f"Function not found in LLVM IR: {function_name}")
+
+	for i in range(start + 1, len(lines)):
+		if lines[i].strip() == "}":
+			return start, i, header
+
+	raise ValueError(f"Function body for {function_name} is not closed")
+
+
+def _first_runtime_call_dims(llvm_text: str, function_name: str) -> Dict[str, int]:
+	lines = llvm_text.splitlines(keepends=True)
+	start, end, _ = _find_function_region(lines, function_name)
+	body_lines = lines[start + 1:end]
+	pattern = re.compile(r"call\s+.*?@(?P<callee>[^(]+)\(i32(?:\s+\w+)*\s+(?P<dim>\d+)\)")
+	dims: Dict[str, int] = {}
+	for line in body_lines:
+		match = pattern.search(line)
+		if not match:
+			continue
+		callee = match.group("callee")
+		if callee in {"_Z12get_group_idj", "_Z12get_local_idj"} and callee not in dims:
+			dims[callee] = int(match.group("dim"))
+	return dims
+
+
+def _build_symb_substitutions(
+	llvm_text: str,
+	function_name: str,
+	runtime_ids: RuntimeIdSelection = DEFAULT_RUNTIME_IDS,
+) -> Dict[str, int]:
+	call_dims = _first_runtime_call_dims(llvm_text, function_name)
+	substitutions: Dict[str, int] = {}
+	for callee, dim in call_dims.items():
+		if callee == "_Z12get_group_idj":
+			value = int(runtime_ids.group_ids[dim])
+		elif callee == "_Z12get_local_idj":
+			value = int(runtime_ids.local_ids[dim])
+		else:
+			continue
+		substitutions[f"call_ret_{callee}"] = value
+	return substitutions
 
 
 def _run_symb_viewer(command: List[str]) -> None:
@@ -92,7 +167,12 @@ def _run_instr_count(llvm_ir_path: Path, kernel_function: str, output_json: Path
 	raise RuntimeError("Failed to run symb-viewer instruction count command")
 
 
-def _run_formula(llvm_ir_path: Path, kernel_function: str, output_json: Path) -> None:
+def _run_formula(
+	llvm_ir_path: Path,
+	kernel_function: str,
+	output_json: Path,
+	substitutions: Optional[Dict[str, int]] = None,
+) -> None:
 	cmd = [
 		"symb-viewer",
 		"formula",
@@ -100,6 +180,10 @@ def _run_formula(llvm_ir_path: Path, kernel_function: str, output_json: Path) ->
 		kernel_function,
 		f"--json={output_json}",
 	]
+	if substitutions:
+		subs_json = output_json.parent / "symb_subs.json"
+		subs_json.write_text(json.dumps(substitutions, indent=2, sort_keys=True))
+		cmd.append(f"-subs={subs_json}")
 	_run_symb_viewer(cmd)
 
 
@@ -110,6 +194,7 @@ def _load_json(path: Path) -> Any:
 
 def _extract_bb_counts(formula_json: Dict[str, Any]) -> Dict[str, int]:
 	counts: Dict[str, int] = {}
+	non_integer_counts: Dict[str, str] = {}
 	for graph in formula_json.get("basic_graphs", []):
 		if graph.get("graph_type") != "BasicBlock":
 			continue
@@ -117,7 +202,14 @@ def _extract_bb_counts(formula_json: Dict[str, Any]) -> Dict[str, int]:
 		count_raw = graph.get("count")
 		if not name or count_raw is None:
 			continue
-		counts[str(name)] = _parse_hex_count(str(count_raw))
+		block_name = str(name)
+		raw_count = str(count_raw)
+		try:
+			counts[block_name] = _parse_symb_count(raw_count)
+		except ValueError:
+			non_integer_counts[block_name] = raw_count
+	if non_integer_counts:
+		raise SymbolicCountParseError(non_integer_counts)
 	return counts
 
 
@@ -165,7 +257,16 @@ def extract_instruction_counts(llvm_ir_path: str, kernel_function: Optional[str]
 		bb_json_path = tmp / "bbcount.json"
 
 		_run_instr_count(llvm_path, resolved_kernel_function, instr_json_path)
-		_run_formula(llvm_path, resolved_kernel_function, bb_json_path)
+		symb_substitutions = _build_symb_substitutions(
+			llvm_path.read_text(),
+			resolved_kernel_function,
+		)
+		_run_formula(
+			llvm_path,
+			resolved_kernel_function,
+			bb_json_path,
+			substitutions=symb_substitutions,
+		)
 
 		instr_json = _load_json(instr_json_path)
 		bb_json = _load_json(bb_json_path)
