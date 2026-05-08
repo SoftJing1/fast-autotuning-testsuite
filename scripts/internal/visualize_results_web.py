@@ -215,6 +215,8 @@ def _variant_sort_key(variant: str) -> tuple[int, str]:
 FOCUS_OPTIONS = ["all", "long_runtime", "short_runtime", "large_total", "small_total"]
 ROW_SORT_OPTIONS = ["exp_id", "runtime_desc", "runtime_asc", "scaled_desc", "scaled_asc"]
 OPCODE_SORT_OPTIONS = ["name", "total_desc", "variance_desc"]
+HEATMAP_COLOR_MODE_OPTIONS = ["mix_plus_total", "portion_only"]
+HISTOGRAM_OVERLAY_OPTIONS = ["none", "fastest", "slowest", "largest_total", "smallest_total"]
 
 
 def _cycle_option(options: Sequence[str], current_value: str | None, direction: int) -> str | None:
@@ -540,6 +542,42 @@ def _focused_records(
 	return _sort_records(focused, row_sort, include_call)[:limit], limit
 
 
+def _overlay_records(
+	records: List[Dict[str, Any]],
+	overlay_mode: str | None,
+	count_value: Any,
+	include_call: bool,
+) -> tuple[List[Dict[str, Any]], int]:
+	if not records or not overlay_mode or overlay_mode == "none":
+		return [], 0
+	try:
+		limit = max(1, min(MAX_HISTOGRAM_ROWS, int(count_value or 100)))
+	except (TypeError, ValueError):
+		limit = 100
+
+	if overlay_mode == "fastest":
+		selected = _sort_records(records, "runtime_asc", include_call)
+	elif overlay_mode == "slowest":
+		selected = _sort_records(records, "runtime_desc", include_call)
+	elif overlay_mode == "largest_total":
+		selected = _sort_records(records, "scaled_desc", include_call)
+	elif overlay_mode == "smallest_total":
+		selected = _sort_records(records, "scaled_asc", include_call)
+	else:
+		return [], limit
+	return selected[:limit], limit
+
+
+def _overlay_label(overlay_mode: str | None) -> str:
+	return {
+		"none": "No overlay",
+		"fastest": "Fastest kernels",
+		"slowest": "Slowest kernels",
+		"largest_total": "Most instructions",
+		"smallest_total": "Least instructions",
+	}.get(overlay_mode or "none", "No overlay")
+
+
 def _sorted_opcodes(records: List[Dict[str, Any]], opcodes: Sequence[str], sort_mode: str, include_call: bool) -> List[str]:
 	filtered = [op for op in opcodes if include_call or op != "call"]
 	if sort_mode == "total_desc":
@@ -581,10 +619,39 @@ def _build_heatmap_matrix(
 	reference_records: List[Dict[str, Any]],
 	opcodes: Sequence[str],
 	include_call: bool,
+	color_mode: str = "mix_plus_total",
 ) -> List[List[float]]:
 	if not records or not opcodes:
 		return []
+	if color_mode == "portion_only":
+		return _build_heatmap_portion_matrix(records, opcodes, include_call)
+	return _build_heatmap_mix_plus_total_matrix(records, reference_records, opcodes, include_call)
 
+
+def _build_heatmap_portion_matrix(
+	records: List[Dict[str, Any]],
+	opcodes: Sequence[str],
+	include_call: bool,
+) -> List[List[float]]:
+	matrix: List[List[float]] = []
+	for record in records:
+		counts = _filtered_counts(record, include_call)
+		row_total = sum(int(counts.get(op, 0)) for op in opcodes)
+		matrix.append(
+			[
+				0.0 if row_total <= 0 else int(counts.get(op, 0)) / row_total
+				for op in opcodes
+			]
+		)
+	return matrix
+
+
+def _build_heatmap_mix_plus_total_matrix(
+	records: List[Dict[str, Any]],
+	reference_records: List[Dict[str, Any]],
+	opcodes: Sequence[str],
+	include_call: bool,
+) -> List[List[float]]:
 	reference_totals = [math.log1p(_total_for_record(record, include_call)) for record in reference_records]
 	min_total = min(reference_totals) if reference_totals else 0.0
 	max_total = max(reference_totals) if reference_totals else 0.0
@@ -605,6 +672,28 @@ def _build_heatmap_matrix(
 	return matrix
 
 
+def _heatmap_colorbar_title(color_mode: str) -> str:
+	return "Opcode share" if color_mode == "portion_only" else "Mix + total"
+
+
+def _heatmap_colorscale(color_mode: str) -> List[List[Any]]:
+	if color_mode == "portion_only":
+		return [
+			[0.0, "#f8fafc"],
+			[0.2, "#fef3c7"],
+			[0.45, "#f59e0b"],
+			[0.7, "#dc2626"],
+			[1.0, "#7f1d1d"],
+		]
+	return [
+		[0.0, "#f8fafc"],
+		[0.18, "#d9f99d"],
+		[0.42, "#22c55e"],
+		[0.68, "#7c3aed"],
+		[1.0, "#111827"],
+	]
+
+
 def _empty_figure(message: str) -> go.Figure:
 	fig = go.Figure()
 	fig.add_annotation(text=message, showarrow=False, x=0.5, y=0.5, xref="paper", yref="paper")
@@ -622,13 +711,14 @@ def _build_heatmap_figure(
 	reference_records: List[Dict[str, Any]],
 	opcodes: Sequence[str],
 	include_call: bool,
+	color_mode: str = "mix_plus_total",
 ) -> go.Figure:
 	if not records:
 		return _empty_figure("No instruction-mix rows for this selection.")
 	if not opcodes:
 		return _empty_figure("No opcodes for this selection.")
 
-	z_values = _build_heatmap_matrix(records, reference_records, opcodes, include_call)
+	z_values = _build_heatmap_matrix(records, reference_records, opcodes, include_call, color_mode)
 	y_labels = [f"{record['exp_id']} {record['param_hash'][:8]}" for record in records]
 	customdata = []
 	for record in records:
@@ -663,15 +753,10 @@ def _build_heatmap_figure(
 			x=list(opcodes),
 			y=y_labels,
 			customdata=customdata,
-			colorscale=[
-				[0.0, "#f8fafc"],
-				[0.35, "#bae6fd"],
-				[0.7, "#0ea5e9"],
-				[1.0, "#0f172a"],
-			],
+			colorscale=_heatmap_colorscale(color_mode),
 			zmin=0,
 			zmax=1,
-			colorbar={"title": "Intensity"},
+			colorbar={"title": _heatmap_colorbar_title(color_mode)},
 			hovertemplate=(
 				"exp_id=%{customdata[0]}<br>"
 				"hash=%{customdata[1]}<br>"
@@ -696,30 +781,63 @@ def _build_heatmap_figure(
 	return fig
 
 
-def _histogram_bin_rows(values: Sequence[int], bin_count: int) -> List[Dict[str, Any]]:
+def _histogram_log_edges(values: Sequence[int], bin_count: int) -> List[float]:
 	if not values:
 		return []
 	log_values = [math.log1p(max(0, int(value))) for value in values]
 	min_log = min(log_values)
 	max_log = max(log_values)
 	if min_log == max_log:
-		raw_value = int(round(math.expm1(min_log)))
-		return [{"center": min_log, "frequency": len(values), "low": raw_value, "high": raw_value}]
+		return [min_log, max_log]
 
 	bin_count = max(1, min(80, int(bin_count)))
 	width = (max_log - min_log) / bin_count
-	bins = [{"center": min_log + (index + 0.5) * width, "frequency": 0, "low": 0, "high": 0} for index in range(bin_count)]
-	for index, row in enumerate(bins):
-		row["low"] = int(math.floor(math.expm1(min_log + index * width)))
-		row["high"] = int(math.ceil(math.expm1(min_log + (index + 1) * width)))
+	return [min_log + index * width for index in range(bin_count + 1)]
 
-	for log_value in log_values:
-		index = min(bin_count - 1, max(0, int((log_value - min_log) / width)))
+
+def _histogram_bin_rows(values: Sequence[int], bin_count: int, log_edges: Sequence[float] | None = None) -> List[Dict[str, Any]]:
+	if not values:
+		return []
+	edges = list(log_edges or _histogram_log_edges(values, bin_count))
+	if len(edges) < 2:
+		return []
+	if edges[0] == edges[-1]:
+		raw_value = int(round(math.expm1(edges[0])))
+		return [{"center": edges[0], "frequency": len(values), "low": raw_value, "high": raw_value}]
+
+	bins = [
+		{
+			"center": (edges[index] + edges[index + 1]) * 0.5,
+			"frequency": 0,
+			"low": 0,
+			"high": 0,
+		}
+		for index in range(len(edges) - 1)
+	]
+	for index, row in enumerate(bins):
+		row["low"] = int(math.floor(math.expm1(edges[index])))
+		row["high"] = int(math.ceil(math.expm1(edges[index + 1])))
+
+	for value in values:
+		log_value = math.log1p(max(0, int(value)))
+		if log_value <= edges[0]:
+			index = 0
+		elif log_value >= edges[-1]:
+			index = len(bins) - 1
+		else:
+			index = next(edge_index for edge_index in range(len(edges) - 1) if edges[edge_index] <= log_value < edges[edge_index + 1])
 		bins[index]["frequency"] += 1
 	return bins
 
 
-def _build_histogram_figure(records: List[Dict[str, Any]], opcodes: Sequence[str], include_call: bool, bin_count_value: Any) -> go.Figure:
+def _build_histogram_figure(
+	records: List[Dict[str, Any]],
+	opcodes: Sequence[str],
+	include_call: bool,
+	bin_count_value: Any,
+	overlay_records: List[Dict[str, Any]] | None = None,
+	overlay_label: str = "Overlay",
+) -> go.Figure:
 	if not records or not opcodes:
 		return _empty_figure("No histogram data for this selection.")
 	opcodes = [
@@ -739,7 +857,13 @@ def _build_histogram_figure(records: List[Dict[str, Any]], opcodes: Sequence[str
 	fig = make_subplots(rows=rows, cols=cols, subplot_titles=list(opcodes), horizontal_spacing=0.08, vertical_spacing=0.08)
 	for index, op in enumerate(opcodes):
 		values = [int(_filtered_counts(record, include_call).get(op, 0)) for record in records]
-		bins = _histogram_bin_rows(values, bin_count)
+		overlay_values = [
+			int(_filtered_counts(record, include_call).get(op, 0))
+			for record in (overlay_records or [])
+		]
+		bin_edges = _histogram_log_edges(values + overlay_values, bin_count)
+		bins = _histogram_bin_rows(values, bin_count, bin_edges)
+		overlay_bins = _histogram_bin_rows(overlay_values, bin_count, bin_edges) if overlay_values else []
 		row_index = index // cols + 1
 		col_index = index % cols + 1
 		fig.add_trace(
@@ -747,19 +871,35 @@ def _build_histogram_figure(records: List[Dict[str, Any]], opcodes: Sequence[str
 				x=[bin_row["center"] for bin_row in bins],
 				y=[bin_row["frequency"] for bin_row in bins],
 				customdata=[[bin_row["low"], bin_row["high"]] for bin_row in bins],
-				marker_color="#2563eb",
-				hovertemplate="scaled count %{customdata[0]} to %{customdata[1]}<br>configs=%{y}<extra></extra>",
-				showlegend=False,
+				marker_color="rgba(100, 116, 139, 0.55)",
+				name="Current selection",
+				hovertemplate="current<br>scaled count %{customdata[0]} to %{customdata[1]}<br>configs=%{y}<extra></extra>",
+				showlegend=index == 0,
 			),
 			row=row_index,
 			col=col_index,
 		)
+		if overlay_bins:
+			fig.add_trace(
+				go.Bar(
+					x=[bin_row["center"] for bin_row in overlay_bins],
+					y=[bin_row["frequency"] for bin_row in overlay_bins],
+					customdata=[[bin_row["low"], bin_row["high"]] for bin_row in overlay_bins],
+					marker_color="rgba(220, 38, 38, 0.68)",
+					name=overlay_label,
+					hovertemplate=f"{overlay_label}<br>scaled count %{{customdata[0]}} to %{{customdata[1]}}<br>configs=%{{y}}<extra></extra>",
+					showlegend=index == 0,
+				),
+				row=row_index,
+				col=col_index,
+			)
 		fig.update_xaxes(title_text="log1p count", row=row_index, col=col_index)
 		fig.update_yaxes(title_text="configs", row=row_index, col=col_index)
 
 	fig.update_layout(
 		height=max(520, rows * 230),
 		margin={"l": 50, "r": 20, "t": 50, "b": 50},
+		barmode="overlay",
 	)
 	return fig
 
@@ -838,7 +978,7 @@ def _write_analysis_log(path: Path, db_path: Path) -> None:
 		"gemm_launch=local sizes from num_wi_l_1/num_wi_l_2/num_wi_r_1; num groups from num_wg_*; gemm_2 uses one r_1 workgroup",
 		"opcode_policy=call is preserved in the data and controlled by an interactive include/exclude toggle",
 		"gemm_policy=primary is gemm_1, combined is gemm_1 plus gemm_2 after per-template launch scaling, gemm_2 remains inspectable",
-		"heatmap_color=row_opcode_ratio * (0.25 + 0.75 * normalized_log_total_scaled_count)",
+		"heatmap_color=interactive mode chooses either true per-row opcode share or row_max opcode ratio * (0.25 + 0.75 * normalized_log_total_scaled_count)",
 		"histogram_policy=per-op small multiples over log1p scaled-count bins; hover reports raw scaled-count bin ranges",
 		"tuning_param_filter_policy=heatmap and histogram each expose single-value filters for every tuning parameter in the selected kernel/input/variant group; defaults keep all values",
 		"rationale=instruction mix is stored per work item/program path, so launch scaling keeps configurations comparable by launched work volume",
@@ -1169,6 +1309,25 @@ def _pick_server_port(host: str, preferred_port: int) -> tuple[int, bool]:
 			return int(sock.getsockname()[1]), True
 
 
+def _display_urls(host: str, port: int) -> List[str]:
+	if host not in {"0.0.0.0", "::"}:
+		return [f"http://{host}:{port}"]
+
+	urls = [f"http://127.0.0.1:{port}"]
+	try:
+		infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET, socket.SOCK_STREAM)
+	except OSError:
+		infos = []
+	for info in infos:
+		address = info[4][0]
+		if address.startswith("127."):
+			continue
+		url = f"http://{address}:{port}"
+		if url not in urls:
+			urls.append(url)
+	return urls
+
+
 def create_dash_app(db_path: Path) -> Dash:
 	if DASH_IMPORT_ERROR is not None:
 		raise SystemExit(
@@ -1308,11 +1467,14 @@ def create_dash_app(db_path: Path) -> Dash:
           "mix-heatmap-row-sort",
           "mix-heatmap-opcode-sort",
           "mix-heatmap-min-op-total",
+          "mix-heatmap-color-mode",
           "mix-hist-kernel-filter",
           "mix-hist-size-filter",
           "mix-hist-variant-filter",
           "mix-hist-call-toggle",
           "mix-hist-focus-mode",
+          "mix-hist-overlay-mode",
+          "mix-hist-overlay-count",
           "mix-hist-row-limit",
           "mix-hist-opcode-sort",
           "mix-hist-bins"
@@ -1372,6 +1534,7 @@ def create_dash_app(db_path: Path) -> Dash:
           const numericIds = new Set([
             "mix-heatmap-row-limit",
             "mix-heatmap-min-op-total",
+            "mix-hist-overlay-count",
             "mix-hist-row-limit",
             "mix-hist-bins"
           ]);
@@ -1561,7 +1724,22 @@ def create_dash_app(db_path: Path) -> Dash:
 										type="number",
 										min=0,
 										step=1,
-										value=0,
+										value=100,
+									),
+								]
+							),
+							html.Div(
+								[
+									html.Div("Heatmap color", className="filter-label"),
+									dcc.Dropdown(
+										id="mix-heatmap-color-mode",
+										options=[
+											{"label": "Portion + total count", "value": "mix_plus_total"},
+											{"label": "Portion only", "value": "portion_only"},
+										],
+										value="portion_only",
+										clearable=False,
+										searchable=False,
 									),
 								]
 							),
@@ -1643,6 +1821,30 @@ def create_dash_app(db_path: Path) -> Dash:
 										clearable=False,
 										searchable=False,
 									),
+								]
+							),
+							html.Div(
+								[
+									html.Div("Overlay group", className="filter-label"),
+									dcc.Dropdown(
+										id="mix-hist-overlay-mode",
+										options=[
+											{"label": "No overlay", "value": "none"},
+											{"label": "Fastest kernels", "value": "fastest"},
+											{"label": "Slowest kernels", "value": "slowest"},
+											{"label": "Most instructions", "value": "largest_total"},
+											{"label": "Least instructions", "value": "smallest_total"},
+										],
+										value="none",
+										clearable=False,
+										searchable=False,
+									),
+								]
+							),
+							html.Div(
+								[
+									html.Div("Overlay kernels", className="filter-label"),
+									dcc.Input(id="mix-hist-overlay-count", type="number", min=1, max=MAX_HISTOGRAM_ROWS, step=1, value=100),
 								]
 							),
 							html.Div(
@@ -1868,11 +2070,14 @@ def create_dash_app(db_path: Path) -> Dash:
 		Output("mix-heatmap-row-sort", "value", allow_duplicate=True),
 		Output("mix-heatmap-opcode-sort", "value", allow_duplicate=True),
 		Output("mix-heatmap-min-op-total", "value", allow_duplicate=True),
+		Output("mix-heatmap-color-mode", "value", allow_duplicate=True),
 		Output("mix-hist-kernel-filter", "value", allow_duplicate=True),
 		Output("mix-hist-size-filter", "value", allow_duplicate=True),
 		Output("mix-hist-variant-filter", "value", allow_duplicate=True),
 		Output("mix-hist-call-toggle", "value", allow_duplicate=True),
 		Output("mix-hist-focus-mode", "value", allow_duplicate=True),
+		Output("mix-hist-overlay-mode", "value", allow_duplicate=True),
+		Output("mix-hist-overlay-count", "value", allow_duplicate=True),
 		Output("mix-hist-row-limit", "value", allow_duplicate=True),
 		Output("mix-hist-opcode-sort", "value", allow_duplicate=True),
 		Output("mix-hist-bins", "value", allow_duplicate=True),
@@ -1890,11 +2095,14 @@ def create_dash_app(db_path: Path) -> Dash:
 		State("mix-heatmap-row-sort", "value"),
 		State("mix-heatmap-opcode-sort", "value"),
 		State("mix-heatmap-min-op-total", "value"),
+		State("mix-heatmap-color-mode", "value"),
 		State("mix-hist-kernel-filter", "value"),
 		State("mix-hist-size-filter", "value"),
 		State("mix-hist-variant-filter", "value"),
 		State("mix-hist-call-toggle", "value"),
 		State("mix-hist-focus-mode", "value"),
+		State("mix-hist-overlay-mode", "value"),
+		State("mix-hist-overlay-count", "value"),
 		State("mix-hist-row-limit", "value"),
 		State("mix-hist-opcode-sort", "value"),
 		State("mix-hist-bins", "value"),
@@ -1916,11 +2124,14 @@ def create_dash_app(db_path: Path) -> Dash:
 		heatmap_row_sort: str | None,
 		heatmap_opcode_sort: str | None,
 		heatmap_min_op_total: Any,
+		heatmap_color_mode: str | None,
 		hist_kernel: str | None,
 		hist_size: str | None,
 		hist_variant: str | None,
 		hist_call: List[str] | None,
 		hist_focus: str | None,
+		hist_overlay_mode: str | None,
+		hist_overlay_count: Any,
 		hist_rows: Any,
 		hist_opcode_sort: str | None,
 		hist_bins: Any,
@@ -1935,7 +2146,7 @@ def create_dash_app(db_path: Path) -> Dash:
 		hist_param_no_update = [no_update] * len(hist_param_values)
 
 		def unchanged(seq_value: Any = no_update):
-			return (no_update,) * 17 + (heatmap_param_no_update, hist_param_no_update, seq_value)
+			return (no_update,) * 20 + (heatmap_param_no_update, hist_param_no_update, seq_value)
 
 		if not shortcut_value:
 			return unchanged()
@@ -1962,11 +2173,14 @@ def create_dash_app(db_path: Path) -> Dash:
 			heatmap_row_sort,
 			heatmap_opcode_sort,
 			heatmap_min_op_total,
+			heatmap_color_mode,
 			hist_kernel,
 			hist_size,
 			hist_variant,
 			hist_call or [],
 			hist_focus,
+			hist_overlay_mode,
+			hist_overlay_count,
 			hist_rows,
 			hist_opcode_sort,
 			hist_bins,
@@ -2018,26 +2232,32 @@ def create_dash_app(db_path: Path) -> Dash:
 		elif target == "mix-heatmap-min-op-total":
 			step = max(1, int(abs(_to_int(heatmap_min_op_total, default=0)) * 0.25) or 1_000_000)
 			values[8] = max(0, _to_int(heatmap_min_op_total, default=0) + direction * step)
+		elif target == "mix-heatmap-color-mode":
+			values[9] = pick(HEATMAP_COLOR_MODE_OPTIONS, heatmap_color_mode)
 		elif target == "mix-hist-kernel-filter":
-			values[9] = pick(mix_dataset["kernels"], hist_kernel)
-			sizes = mix_dataset["sizes_by_kernel"].get(values[9] or "", [])
-			variants = mix_dataset["variants_by_kernel"].get(values[9] or "", [])
-			values[10] = values[10] if values[10] in sizes else (sizes[0] if sizes else None)
-			values[11] = values[11] if values[11] in variants else ("primary" if "primary" in variants else (variants[0] if variants else None))
+			values[10] = pick(mix_dataset["kernels"], hist_kernel)
+			sizes = mix_dataset["sizes_by_kernel"].get(values[10] or "", [])
+			variants = mix_dataset["variants_by_kernel"].get(values[10] or "", [])
+			values[11] = values[11] if values[11] in sizes else (sizes[0] if sizes else None)
+			values[12] = values[12] if values[12] in variants else ("primary" if "primary" in variants else (variants[0] if variants else None))
 		elif target == "mix-hist-size-filter":
-			values[10] = pick(mix_dataset["sizes_by_kernel"].get(hist_kernel or "", []), hist_size)
+			values[11] = pick(mix_dataset["sizes_by_kernel"].get(hist_kernel or "", []), hist_size)
 		elif target == "mix-hist-variant-filter":
-			values[11] = pick(mix_dataset["variants_by_kernel"].get(hist_kernel or "", []), hist_variant)
+			values[12] = pick(mix_dataset["variants_by_kernel"].get(hist_kernel or "", []), hist_variant)
 		elif target == "mix-hist-call-toggle":
-			values[12] = [] if "call" in (hist_call or []) else ["call"]
+			values[13] = [] if "call" in (hist_call or []) else ["call"]
 		elif target == "mix-hist-focus-mode":
-			values[13] = pick(FOCUS_OPTIONS, hist_focus)
+			values[14] = pick(FOCUS_OPTIONS, hist_focus)
+		elif target == "mix-hist-overlay-mode":
+			values[15] = pick(HISTOGRAM_OVERLAY_OPTIONS, hist_overlay_mode)
+		elif target == "mix-hist-overlay-count":
+			values[16] = _step_numeric(hist_overlay_count, direction, 1, MAX_HISTOGRAM_ROWS, 50)
 		elif target == "mix-hist-row-limit":
-			values[14] = _step_numeric(hist_rows, direction, 1, MAX_HISTOGRAM_ROWS, 500)
+			values[17] = _step_numeric(hist_rows, direction, 1, MAX_HISTOGRAM_ROWS, 500)
 		elif target == "mix-hist-opcode-sort":
-			values[15] = pick(OPCODE_SORT_OPTIONS, hist_opcode_sort)
+			values[18] = pick(OPCODE_SORT_OPTIONS, hist_opcode_sort)
 		elif target == "mix-hist-bins":
-			values[16] = _step_numeric(hist_bins, direction, 4, 80, 1)
+			values[19] = _step_numeric(hist_bins, direction, 4, 80, 1)
 		else:
 			param_target = _shortcut_param_target(target)
 			if not param_target:
@@ -2052,7 +2272,7 @@ def create_dash_app(db_path: Path) -> Dash:
 				)
 				if updated is None:
 					return unchanged(seq)
-				return (no_update,) * 17 + (updated, hist_param_no_update, seq)
+				return (no_update,) * 20 + (updated, hist_param_no_update, seq)
 			updated = pick_param_value(
 				_records_for_group(mix_dataset, hist_kernel, hist_size, hist_variant),
 				hist_param_ids,
@@ -2061,7 +2281,7 @@ def create_dash_app(db_path: Path) -> Dash:
 			)
 			if updated is None:
 				return unchanged(seq)
-			return (no_update,) * 17 + (heatmap_param_no_update, updated, seq)
+			return (no_update,) * 20 + (heatmap_param_no_update, updated, seq)
 
 		return (*values, heatmap_param_no_update, hist_param_no_update, seq)
 
@@ -2078,12 +2298,15 @@ def create_dash_app(db_path: Path) -> Dash:
 		Input("mix-heatmap-row-sort", "value"),
 		Input("mix-heatmap-opcode-sort", "value"),
 		Input("mix-heatmap-min-op-total", "value"),
+		Input("mix-heatmap-color-mode", "value"),
 		Input({"type": "mix-heatmap-param-filter", "param": ALL}, "value"),
 		Input("mix-hist-kernel-filter", "value"),
 		Input("mix-hist-size-filter", "value"),
 		Input("mix-hist-variant-filter", "value"),
 		Input("mix-hist-call-toggle", "value"),
 		Input("mix-hist-focus-mode", "value"),
+		Input("mix-hist-overlay-mode", "value"),
+		Input("mix-hist-overlay-count", "value"),
 		Input("mix-hist-row-limit", "value"),
 		Input("mix-hist-opcode-sort", "value"),
 		Input("mix-hist-bins", "value"),
@@ -2102,12 +2325,15 @@ def create_dash_app(db_path: Path) -> Dash:
 		heatmap_row_sort: str | None,
 		heatmap_opcode_sort: str | None,
 		heatmap_min_op_total: Any,
+		heatmap_color_mode: str | None,
 		heatmap_param_values: List[Any],
 		hist_kernel_type: str | None,
 		hist_input_size: str | None,
 		hist_variant: str | None,
 		hist_call_toggle: List[str] | None,
 		hist_focus_mode: str | None,
+		hist_overlay_mode: str | None,
+		hist_overlay_count: Any,
 		hist_row_limit: Any,
 		hist_opcode_sort: str | None,
 		hist_bins: Any,
@@ -2138,6 +2364,12 @@ def create_dash_app(db_path: Path) -> Dash:
 			hist_include_call,
 			MAX_HISTOGRAM_ROWS,
 		)
+		histogram_overlay_rows, overlay_limit = _overlay_records(
+			hist_records,
+			hist_overlay_mode,
+			hist_overlay_count,
+			hist_include_call,
+		)
 		heatmap_opcodes = _sorted_opcodes(heatmap_rows or records, mix_dataset["opcodes"], heatmap_opcode_sort or "name", heatmap_include_call)
 		heatmap_opcodes = _filter_opcodes_by_min_total(
 			heatmap_rows or records,
@@ -2146,8 +2378,21 @@ def create_dash_app(db_path: Path) -> Dash:
 			heatmap_min_op_total,
 		)
 		histogram_opcodes = _sorted_opcodes(histogram_rows or hist_records, mix_dataset["opcodes"], hist_opcode_sort or "name", hist_include_call)
-		heatmap_fig = _build_heatmap_figure(heatmap_rows, records, heatmap_opcodes, heatmap_include_call)
-		histogram_fig = _build_histogram_figure(histogram_rows, histogram_opcodes, hist_include_call, hist_bins)
+		heatmap_fig = _build_heatmap_figure(
+			heatmap_rows,
+			records,
+			heatmap_opcodes,
+			heatmap_include_call,
+			heatmap_color_mode or "mix_plus_total",
+		)
+		histogram_fig = _build_histogram_figure(
+			histogram_rows,
+			histogram_opcodes,
+			hist_include_call,
+			hist_bins,
+			histogram_overlay_rows,
+			_overlay_label(hist_overlay_mode),
+		)
 
 		group_count = len(group_records)
 		hist_count = len(histogram_rows)
@@ -2155,9 +2400,11 @@ def create_dash_app(db_path: Path) -> Dash:
 			f"Heatmap {kernel_type or '-'} {input_size or '-'} {_variant_label(variant or '-')}: "
 			f"heatmap shows {len(heatmap_rows)} row(s) with limit={heatmap_limit}; "
 			f"heatmap uses {len(heatmap_opcodes)} opcode column(s); "
+			f"color={heatmap_color_mode or 'mix_plus_total'}; "
 			f"tuning filters keep {len(records)}/{group_count} row(s), call={'included' if heatmap_include_call else 'excluded'}. "
 			f"Histograms {hist_kernel_type or '-'} {hist_input_size or '-'} {_variant_label(hist_variant or '-')}: "
 			f"use {hist_count} row(s) with limit={hist_limit}; "
+			f"overlay={_overlay_label(hist_overlay_mode)} rows={len(histogram_overlay_rows)} limit={overlay_limit}; "
 			f"tuning filters keep {len(hist_records)}/{len(hist_group_records)} row(s), call={'included' if hist_include_call else 'excluded'}."
 		)
 		return info, heatmap_fig, histogram_fig
@@ -2268,7 +2515,7 @@ def create_dash_app(db_path: Path) -> Dash:
 def main() -> int:
 	parser = argparse.ArgumentParser(description="Start web visualization server for experiment SQLite database")
 	parser.add_argument("--db", default="experiments.db", help="Path to SQLite experiment database")
-	parser.add_argument("--host", default="127.0.0.1", help="Server host (default: 127.0.0.1)")
+	parser.add_argument("--host", default="0.0.0.0", help="Server host (default: 0.0.0.0; use 127.0.0.1 for local-only)")
 	parser.add_argument("--port", type=int, default=8765, help="Server port (default: 8765)")
 	args = parser.parse_args()
 
@@ -2280,7 +2527,9 @@ def main() -> int:
 	actual_port, used_fallback = _pick_server_port(args.host, args.port)
 	if used_fallback:
 		print(f"Port {args.port} is already in use. Falling back to available port {actual_port}.")
-	print(f"Visualization server started on http://{args.host}:{actual_port}")
+	print(f"Visualization server listening on {args.host}:{actual_port}")
+	for url in _display_urls(args.host, actual_port):
+		print(f"Open: {url}")
 	print(f"Using database: {db_path}")
 	print("Press Ctrl+C to stop.")
 	app.run(host=args.host, port=actual_port, debug=False)
