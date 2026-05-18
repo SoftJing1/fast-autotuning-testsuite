@@ -252,6 +252,21 @@ class ExperimentDB:
 		except sqlite3.Error as e:
 			raise RuntimeError(f"Failed to mark experiment as completed: {e}")
 
+	def mark_profiled(self, exp_id: int, llvm_ir_path: Optional[str] = None) -> bool:
+		"""Mark an experiment as statically profiled without a runtime measurement."""
+		try:
+			cursor = self._execute(
+				"""
+				UPDATE experiments
+				SET status = 'profiled', llvm_ir_path = ?, error_msg = NULL
+				WHERE exp_id = ?
+				""",
+				(llvm_ir_path, exp_id),
+			)
+			return cursor.rowcount > 0
+		except sqlite3.Error as e:
+			raise RuntimeError(f"Failed to mark experiment as profiled: {e}")
+
 	def mark_failed(self, exp_id: int, error_msg: str = "") -> bool:
 		try:
 			cursor = self._execute(
@@ -324,6 +339,28 @@ class ExperimentDB:
 			return self._row_to_experiment(row) if row else None
 		except sqlite3.Error as e:
 			raise RuntimeError(f"Failed to query experiment: {e}")
+
+	def get_experiment_by_key(
+		self,
+		kernel_type: str,
+		input_size: str,
+		param_hash: str,
+	) -> Optional[ExperimentResult]:
+		try:
+			cursor = self._execute(
+				"""
+				SELECT exp_id, kernel_type, input_size, param_hash, config_json,
+				       runtime_ms, llvm_ir_path, timestamp, status
+				FROM experiments
+				WHERE kernel_type = ? AND input_size = ? AND param_hash = ?
+				LIMIT 1
+				""",
+				(kernel_type, input_size, param_hash),
+			)
+			row = cursor.fetchone()
+			return self._row_to_experiment(row) if row else None
+		except sqlite3.Error as e:
+			raise RuntimeError(f"Failed to query experiment by key: {e}")
 
 	def get_experiments_by_kernel_type(self, kernel_type: str, status: Optional[str] = None) -> List[ExperimentResult]:
 		try:

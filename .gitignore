@@ -8,3 +8,5 @@ experiments/
 validation/
 .codex
 notes/
+*.db
+prototype/two-step-autotuning/runs/

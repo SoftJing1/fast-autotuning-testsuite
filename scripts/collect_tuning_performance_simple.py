@@ -294,6 +294,18 @@ def _kernel_size_string(kernel_type: str, config_dict: Dict) -> str:
 	return f"{config_dict.get('input_size_h', 0)}x{config_dict.get('input_size_w', 0)}"
 
 
+def _runtime_kernel_function(llvm_ir_path: Path, kernel_function: str) -> str:
+	"""Prefer Clang's generated implementation body over the tiny exported wrapper."""
+	try:
+		llvm_text = llvm_ir_path.read_text(errors="ignore")
+	except OSError:
+		return kernel_function
+	impl_name = f"__clang_ocl_kern_imp_{kernel_function}"
+	if re.search(rf"^define\s+.*@{re.escape(impl_name)}\(", llvm_text, flags=re.MULTILINE):
+		return impl_name
+	return kernel_function
+
+
 def runtime_ir_artifacts_from_dump(
 	kernel_type: str,
 	config_dict: Dict,
@@ -308,10 +320,11 @@ def runtime_ir_artifacts_from_dump(
 
 	artifacts: List[Dict[str, str]] = []
 	for spec in KERNEL_TEMPLATE_SPECS.get(kernel_type, []):
+		kernel_function = _runtime_kernel_function(output_ll, spec["kernel_function"])
 		artifacts.append(
 			{
 				"template_name": spec["template_name"],
-				"kernel_function": spec["kernel_function"],
+				"kernel_function": kernel_function,
 				"llvm_ir_path": str(output_ll),
 				"opencl_binary_path": str(opencl_binary_path),
 			}

@@ -457,6 +457,7 @@ int main(int argc, char *argv[]) {
   // Load configuration from JSON file
   std::string config_path;
   std::string dump_opencl_binary_path;
+  bool dump_opencl_binary_only = false;
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
     if (arg == "--dump-opencl-binary") {
@@ -466,6 +467,14 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
       }
       dump_opencl_binary_path = argv[++i];
+    } else if (arg == "--dump-opencl-binary-only") {
+      if (i + 1 >= argc) {
+        std::cerr << "Error: --dump-opencl-binary-only requires a path."
+                  << std::endl;
+        return EXIT_FAILURE;
+      }
+      dump_opencl_binary_path = argv[++i];
+      dump_opencl_binary_only = true;
     } else if (config_path.empty()) {
       config_path = arg;
     } else {
@@ -617,6 +626,17 @@ int main(int argc, char *argv[]) {
   if (!dump_opencl_binary_path.empty() &&
       !dump_opencl_program_binary(program, device, dump_opencl_binary_path)) {
     return EXIT_FAILURE;
+  }
+  if (dump_opencl_binary_only) {
+    std::cout << "Dump-only mode completed; kernel execution skipped."
+              << std::endl;
+    clReleaseProgram(program);
+    clReleaseMemObject(buf_in);
+    clReleaseMemObject(buf_dummy);
+    clReleaseMemObject(buf_out);
+    clReleaseCommandQueue(queue);
+    clReleaseContext(context);
+    return EXIT_SUCCESS;
   }
 
   // Create kernel
