@@ -23,12 +23,31 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
+class SymbViewerInvocation:
+	command: List[str]
+	stdout: str
+	stderr: str
+	returncode: int
+
+	def to_dict(self) -> Dict[str, Any]:
+		return {
+			"command": list(self.command),
+			"stdout": self.stdout,
+			"stderr": self.stderr,
+			"returncode": self.returncode,
+		}
+
+
+@dataclass
 class InstCountResult:
 	llvm_ir_path: str
 	kernel_function: str
 	bb_counts: Dict[str, int]
 	bb_instruction_counts: Dict[str, Dict[str, int]]
 	total_instruction_counts: Dict[str, int]
+	raw_instr_count_json: List[Dict[str, Any]]
+	raw_bb_count_json: Dict[str, Any]
+	symb_viewer_invocations: Tuple[SymbViewerInvocation, ...] = ()
 
 	def to_dict(self) -> Dict[str, Any]:
 		return {
@@ -37,6 +56,9 @@ class InstCountResult:
 			"bb_counts": self.bb_counts,
 			"bb_instruction_counts": self.bb_instruction_counts,
 			"total_instruction_counts": self.total_instruction_counts,
+			"raw_instr_count_json": self.raw_instr_count_json,
+			"raw_bb_count_json": self.raw_bb_count_json,
+			"symb_viewer_invocations": [invocation.to_dict() for invocation in self.symb_viewer_invocations],
 		}
 
 
@@ -138,9 +160,15 @@ def _build_symb_substitutions(
 	return substitutions
 
 
-def _run_symb_viewer(command: List[str]) -> None:
+def _run_symb_viewer(command: List[str]) -> SymbViewerInvocation:
 	try:
-		subprocess.run(command, check=True, capture_output=True, text=True)
+		result = subprocess.run(command, check=True, capture_output=True, text=True)
+		return SymbViewerInvocation(
+			command=list(command),
+			stdout=result.stdout,
+			stderr=result.stderr,
+			returncode=result.returncode,
+		)
 	except FileNotFoundError as exc:
 		raise RuntimeError("`symb-viewer` not found in PATH") from exc
 	except subprocess.CalledProcessError as exc:
@@ -150,7 +178,7 @@ def _run_symb_viewer(command: List[str]) -> None:
 		) from exc
 
 
-def _run_instr_count(llvm_ir_path: Path, kernel_function: str, output_json: Path) -> None:
+def _run_instr_count(llvm_ir_path: Path, kernel_function: str, output_json: Path) -> SymbViewerInvocation:
 	# Try the subcommand used in the doc first, then fallback.
 	cmd_candidates = [
 		["symb-viewer", "inst-count", str(llvm_ir_path), kernel_function, "-o", str(output_json)],
@@ -158,8 +186,7 @@ def _run_instr_count(llvm_ir_path: Path, kernel_function: str, output_json: Path
 	last_error: Optional[Exception] = None
 	for cmd in cmd_candidates:
 		try:
-			_run_symb_viewer(cmd)
-			return
+			return _run_symb_viewer(cmd)
 		except Exception as exc:
 			last_error = exc
 	if last_error:
@@ -172,7 +199,7 @@ def _run_formula(
 	kernel_function: str,
 	output_json: Path,
 	substitutions: Optional[Dict[str, int]] = None,
-) -> None:
+) -> SymbViewerInvocation:
 	cmd = [
 		"symb-viewer",
 		"formula",
@@ -184,7 +211,7 @@ def _run_formula(
 		subs_json = output_json.parent / "symb_subs.json"
 		subs_json.write_text(json.dumps(substitutions, indent=2, sort_keys=True))
 		cmd.append(f"-subs={subs_json}")
-	_run_symb_viewer(cmd)
+	return _run_symb_viewer(cmd)
 
 
 def _load_json(path: Path) -> Any:
@@ -256,12 +283,12 @@ def extract_instruction_counts(llvm_ir_path: str, kernel_function: Optional[str]
 		instr_json_path = tmp / "instrcount.json"
 		bb_json_path = tmp / "bbcount.json"
 
-		_run_instr_count(llvm_path, resolved_kernel_function, instr_json_path)
+		instr_invocation = _run_instr_count(llvm_path, resolved_kernel_function, instr_json_path)
 		symb_substitutions = _build_symb_substitutions(
 			llvm_path.read_text(),
 			resolved_kernel_function,
 		)
-		_run_formula(
+		formula_invocation = _run_formula(
 			llvm_path,
 			resolved_kernel_function,
 			bb_json_path,
@@ -281,6 +308,9 @@ def extract_instruction_counts(llvm_ir_path: str, kernel_function: Optional[str]
 		bb_counts=bb_counts,
 		bb_instruction_counts=bb_instruction_counts,
 		total_instruction_counts=total_instruction_counts,
+		raw_instr_count_json=instr_json,
+		raw_bb_count_json=bb_json,
+		symb_viewer_invocations=(instr_invocation, formula_invocation),
 	)
 
 

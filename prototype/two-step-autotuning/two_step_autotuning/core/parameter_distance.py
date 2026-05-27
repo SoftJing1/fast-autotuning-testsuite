@@ -10,8 +10,12 @@ from .parameter_space import ParameterIndexSpec, indices_from_config
 
 
 PARAMETER_DISTANCE_METRICS = (
-	"ordinal",
+	"euclidean",
 )
+
+_PARAMETER_DISTANCE_ALIASES = {
+	"ordinal": "euclidean",
+}
 
 
 @dataclass(frozen=True)
@@ -38,10 +42,6 @@ class ParameterDistanceModel:
 		self.exp_ids = np.array([record.exp_id for record in self.records], dtype=int)
 		self.runtimes = np.array([record.runtime_ms for record in self.records], dtype=float)
 		self.index_matrix = self._build_index_matrix()
-		self.index_denominators = np.array(
-			[max(len(specs[name].values) - 1, 1) for name in self.parameter_names],
-			dtype=float,
-		)
 
 	def _build_index_matrix(self) -> np.ndarray:
 		rows = []
@@ -65,11 +65,10 @@ class ParameterDistanceModel:
 		index_vector: np.ndarray,
 		metric: str,
 	) -> np.ndarray:
-		if metric != "ordinal":
+		metric = _PARAMETER_DISTANCE_ALIASES.get(metric, metric)
+		if metric != "euclidean":
 			raise ValueError(f"Unknown parameter distance metric: {metric}")
-		index_delta = np.abs(self.index_matrix - index_vector)
-		normalized_index_delta = index_delta / self.index_denominators
-		return normalized_index_delta.mean(axis=1)
+		return np.sqrt(((self.index_matrix - index_vector) ** 2).sum(axis=1))
 
 	def _index_vector_from_config(self, config: dict[str, Any]) -> np.ndarray:
 		encoded = indices_from_config(config, self.specs)

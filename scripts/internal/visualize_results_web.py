@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import math
 import socket
 import sqlite3
+import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -1261,6 +1263,95 @@ def _build_inst_counts_payload(
 	return {"rows": processed, "count": len(processed), "limit": limit}
 
 
+def _csv_text(rows: Sequence[Dict[str, Any]]) -> str:
+	if not rows:
+		return ""
+	fieldnames = list(rows[0].keys())
+	buffer = io.StringIO()
+	writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+	writer.writeheader()
+	writer.writerows(rows)
+	return buffer.getvalue()
+
+
+def _raw_export_rows(db_path: Path, mix_dataset: Dict[str, Any]) -> Dict[str, Any]:
+	experiments = _query_rows(
+		db_path,
+		"""
+		SELECT exp_id, kernel_type, input_size, param_hash, config_json, runtime_ms,
+		       llvm_ir_path, timestamp, status, error_msg
+		FROM experiments
+		ORDER BY exp_id ASC
+		""",
+	)
+	instruction_counts = _query_rows(
+		db_path,
+		"""
+		SELECT id, exp_id, template_name, kernel_function, llvm_ir_path,
+		       bb_counts_json, bb_instruction_counts_json, total_instruction_counts_json, created_at
+		FROM llvm_instruction_counts
+		ORDER BY exp_id ASC, template_name ASC
+		""",
+	)
+	experiment_logs = _query_rows(
+		db_path,
+		"""
+		SELECT log_id, exp_id, stage, level, message, payload_json, created_at
+		FROM experiment_logs
+		ORDER BY log_id ASC
+		""",
+	)
+	return {
+		"db_path": str(db_path),
+		"exported_at": datetime.now().isoformat(),
+		"experiments": experiments,
+		"llvm_instruction_counts": instruction_counts,
+		"experiment_logs": experiment_logs,
+		"instruction_mix_records": mix_dataset["records"],
+		"instruction_mix_template_counts": mix_dataset["template_counts"],
+	}
+
+
+def _raw_export_zip_bytes(db_path: Path, mix_dataset: Dict[str, Any]) -> bytes:
+	raw_rows = _raw_export_rows(db_path, mix_dataset)
+	buffer = io.BytesIO()
+	with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+		archive.writestr("README.txt", "\n".join([
+			"ATF raw data export",
+			f"database={db_path}",
+			f"exported_at={raw_rows['exported_at']}",
+			"contents:",
+			"  - experiments.json / experiments.csv",
+			"  - llvm_instruction_counts.json / llvm_instruction_counts.csv",
+			"  - experiment_logs.json / experiment_logs.csv",
+			"  - instruction_mix_records.json / instruction_mix_records.csv",
+			"  - instruction_mix_template_counts.json / instruction_mix_template_counts.csv",
+		]) + "\n")
+		for key in (
+			"experiments",
+			"llvm_instruction_counts",
+			"experiment_logs",
+			"instruction_mix_records",
+			"instruction_mix_template_counts",
+		):
+			rows = raw_rows[key]
+			archive.writestr(f"{key}.json", json.dumps(rows, indent=2, sort_keys=True) + "\n")
+			archive.writestr(f"{key}.csv", _csv_text(rows))
+		manifest = {
+			"db_path": raw_rows["db_path"],
+			"exported_at": raw_rows["exported_at"],
+			"row_counts": {
+				"experiments": len(raw_rows["experiments"]),
+				"llvm_instruction_counts": len(raw_rows["llvm_instruction_counts"]),
+				"experiment_logs": len(raw_rows["experiment_logs"]),
+				"instruction_mix_records": len(raw_rows["instruction_mix_records"]),
+				"instruction_mix_template_counts": len(raw_rows["instruction_mix_template_counts"]),
+			},
+		}
+		archive.writestr("manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+	return buffer.getvalue()
+
+
 def _format_runtime(value: Any) -> str:
 	if value is None:
 		return "-"
@@ -1588,6 +1679,7 @@ def create_dash_app(db_path: Path) -> Dash:
 			dcc.Store(id="results-store"),
 			dcc.Store(id="inst-store"),
 			dcc.Store(id="mix-shortcut-applied-seq", data=0),
+			dcc.Download(id="raw-data-download"),
 			dcc.Input(id="mix-shortcut-input", type="text", value="", style={"display": "none"}),
 			html.Div(_summary_cards(summary), className="summary-grid"),
 			html.Div(
@@ -1944,6 +2036,12 @@ def create_dash_app(db_path: Path) -> Dash:
 				className="panel",
 				children=[
 					html.H3("Results", className="section-title"),
+					html.Div(
+						className="controls",
+						children=[
+							html.Button("Download full raw data", id="download-raw-data", n_clicks=0),
+						],
+					),
 					html.Div(id="rows-info", className="muted"),
 					html.Div(
 						className="columns-panel",
@@ -2408,6 +2506,15 @@ def create_dash_app(db_path: Path) -> Dash:
 			f"tuning filters keep {len(hist_records)}/{len(hist_group_records)} row(s), call={'included' if hist_include_call else 'excluded'}."
 		)
 		return info, heatmap_fig, histogram_fig
+
+	@callback(
+		Output("raw-data-download", "data"),
+		Input("download-raw-data", "n_clicks"),
+		prevent_initial_call=True,
+	)
+	def _download_raw_data(_n_clicks: int):
+		filename = f"{db_path.stem}_raw_export.zip"
+		return dcc.send_bytes(lambda stream: stream.write(_raw_export_zip_bytes(db_path, mix_dataset)), filename)
 
 	@callback(
 		Output("kernel-filter", "value"),

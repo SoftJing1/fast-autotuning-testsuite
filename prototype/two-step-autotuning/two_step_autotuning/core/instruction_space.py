@@ -12,6 +12,7 @@ from .types import LiveProfile
 
 
 INST_INDEX_PREFIX = "idx.inst."
+EXCLUDED_INSTRUCTION_OPCODES = frozenset({"lifetime.start", "lifetime.end"})
 
 
 @dataclass(frozen=True)
@@ -20,21 +21,25 @@ class InstructionParameterSpec:
 	values: tuple[int, ...]
 
 
+def filter_instruction_opcodes(opcodes: list[str] | set[str] | tuple[str, ...]) -> list[str]:
+	return sorted(op for op in opcodes if op not in EXCLUDED_INSTRUCTION_OPCODES)
+
+
 def build_instruction_parameter_specs(
 	dataset: TuningDataset,
 	max_values_per_op: int,
-	top_config_count: int,
+	top_config_count: int | None = None,
 	min_unique_values: int = 2,
 	min_log_range: int = 1024,
 	min_log_ratio: float = 16.0,
 ) -> dict[str, InstructionParameterSpec]:
 	specs: dict[str, InstructionParameterSpec] = {}
-	for op in dataset.opcodes:
+	for op in filter_instruction_opcodes(dataset.opcodes):
 		values = [int(record.raw_counts.get(op, 0)) for record in dataset.records]
-		unique_values = tuple(sorted(set(values)))
-		if len(unique_values) < min_unique_values:
+		representatives = select_representative_values(values, max_values_per_op)
+		if len(representatives) < min_unique_values:
 			continue
-		specs[op] = InstructionParameterSpec(opcode=op, values=unique_values)
+		specs[op] = InstructionParameterSpec(opcode=op, values=tuple(representatives))
 	return specs
 
 
@@ -42,7 +47,7 @@ def build_instruction_parameter_specs_from_profiles(
 	profiles: list[LiveProfile],
 	max_values_per_op: int,
 ) -> dict[str, InstructionParameterSpec]:
-	opcodes = sorted({op for profile in profiles for op in profile.raw_counts})
+	opcodes = filter_instruction_opcodes({op for profile in profiles for op in profile.raw_counts})
 	specs: dict[str, InstructionParameterSpec] = {}
 	for op in opcodes:
 		values = [int(profile.raw_counts.get(op, 0)) for profile in profiles]
@@ -95,7 +100,7 @@ def nearest_indices_from_counts(
 
 
 def median_instruction_counts(profiles: list[LiveProfile]) -> dict[str, int]:
-	opcodes = sorted({op for profile in profiles for op in profile.raw_counts})
+	opcodes = filter_instruction_opcodes({op for profile in profiles for op in profile.raw_counts})
 	return {
 		op: int(median(int(profile.raw_counts.get(op, 0)) for profile in profiles))
 		for op in opcodes

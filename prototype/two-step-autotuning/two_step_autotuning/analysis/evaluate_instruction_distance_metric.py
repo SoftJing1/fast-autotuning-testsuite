@@ -3,16 +3,17 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import random
 from pathlib import Path
 from statistics import mean, median
 
 from ..core.dataset import TuningDataset
 from ..core.instruction_distance import InstructionDistanceModel, instruction_neighbor_results_to_dicts
-from ..core.resolver import ResolverWeights
-
-
-DEFAULT_DB = "experiments/exp_20260415_large_scale_5000cfg/experiments.db"
+DEFAULT_DB = os.environ.get(
+	"TWO_STEP_AUTOTUNING_DB",
+	"experiments/exp_20260415_large_scale_5000cfg/experiments.db",
+)
 
 
 def _parse_case(value: str) -> tuple[str, str]:
@@ -68,12 +69,11 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
 def evaluate_case(
 	db_path: Path,
 	case: tuple[str, str],
-	weights: ResolverWeights,
 	sample_count: int | None,
 	random_seed: int,
 ) -> tuple[list[dict], dict]:
 	dataset = TuningDataset(db_path, case[0], case[1])
-	model = InstructionDistanceModel(dataset, weights)
+	model = InstructionDistanceModel(dataset)
 	base_indices = list(range(len(dataset.records)))
 	if sample_count is not None and sample_count < len(base_indices):
 		rng = random.Random(random_seed)
@@ -85,9 +85,6 @@ def evaluate_case(
 		row["kernel"] = case[0]
 		row["input_size"] = case[1]
 	summary = _summarize(case, rows)
-	summary["raw_weight"] = weights.raw
-	summary["normalized_weight"] = weights.normalized
-	summary["total_weight"] = weights.total
 	return rows, summary
 
 
@@ -105,9 +102,6 @@ def build_argparser() -> argparse.ArgumentParser:
 	)
 	parser.add_argument("--sample-count", type=int, default=None)
 	parser.add_argument("--random-seed", type=int, default=1)
-	parser.add_argument("--raw-weight", type=float, default=0.4)
-	parser.add_argument("--normalized-weight", type=float, default=0.5)
-	parser.add_argument("--total-weight", type=float, default=0.1)
 	parser.add_argument(
 		"--output-dir",
 		default="prototype/two-step-autotuning/runs/instruction_distance_metric",
@@ -120,11 +114,6 @@ def main() -> int:
 	args = parser.parse_args()
 	db_path = Path(args.db)
 	cases = args.case or [("gaussian", "512x512"), ("gemm", "128x128x128")]
-	weights = ResolverWeights(
-		raw=args.raw_weight,
-		normalized=args.normalized_weight,
-		total=args.total_weight,
-	)
 	output_dir = Path(args.output_dir)
 	output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -134,7 +123,6 @@ def main() -> int:
 		details, summary = evaluate_case(
 			db_path=db_path,
 			case=case,
-			weights=weights,
 			sample_count=args.sample_count,
 			random_seed=args.random_seed,
 		)

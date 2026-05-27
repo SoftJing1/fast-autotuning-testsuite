@@ -18,9 +18,11 @@ class DatabaseApproxParameterResolver:
 		self,
 		dataset: TuningDataset,
 		specs: dict[str, ParameterIndexSpec],
-		metric: str = "ordinal",
+		metric: str = "euclidean",
 		max_distance: float | None = None,
 	):
+		if metric == "ordinal":
+			metric = "euclidean"
 		if metric not in PARAMETER_DISTANCE_METRICS:
 			raise ValueError(f"Unknown parameter distance metric: {metric}")
 		self.dataset = dataset

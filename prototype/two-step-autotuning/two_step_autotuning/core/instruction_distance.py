@@ -6,7 +6,6 @@ from typing import Any
 import numpy as np
 
 from .dataset import TuningDataset
-from .instruction_map import log1p
 from .resolver import ResolverWeights
 
 
@@ -27,7 +26,7 @@ class InstructionNeighborResult:
 
 
 class InstructionDistanceModel:
-	"""Vectorized version of DatabaseApproxInstructionMapResolver's distance."""
+	"""Vectorized Euclidean distance model over instruction-count vectors."""
 
 	def __init__(self, dataset: TuningDataset, weights: ResolverWeights | None = None):
 		self.dataset = dataset
@@ -36,51 +35,26 @@ class InstructionDistanceModel:
 		self.records = dataset.records
 		self.exp_ids = np.array([record.exp_id for record in self.records], dtype=int)
 		self.runtimes = np.array([record.runtime_ms for record in self.records], dtype=float)
-		self.raw_matrix = self._build_raw_matrix()
-		self.mix_matrix = self._build_mix_matrix()
-		self.total_vector = np.log1p(np.array([record.total_count for record in self.records], dtype=float))
-		self.raw_mean = self.raw_matrix.mean(axis=0)
-		self.raw_std = self.raw_matrix.std(axis=0)
-		self.raw_std[self.raw_std < 1.0e-9] = 1.0
-		total_std = float(self.total_vector.std())
-		self.total_std = total_std if total_std >= 1.0e-9 else 1.0
-		self.std_raw_matrix = (self.raw_matrix - self.raw_mean) / self.raw_std
+		self.count_matrix = self._build_count_matrix()
 
-	def _build_raw_matrix(self) -> np.ndarray:
+	def _build_count_matrix(self) -> np.ndarray:
 		return np.array(
-			[[log1p(record.raw_counts.get(op, 0)) for op in self.opcodes] for record in self.records],
+			[[max(float(record.raw_counts.get(op, 0)), 0.0) for op in self.opcodes] for record in self.records],
 			dtype=float,
 		)
-
-	def _build_mix_matrix(self) -> np.ndarray:
-		rows = []
-		for record in self.records:
-			total = float(record.total_count) or 1.0
-			rows.append([float(record.raw_counts.get(op, 0)) / total for op in self.opcodes])
-		return np.array(rows, dtype=float)
 
 	def component_distances_to_counts(
 		self,
 		counts: dict[str, Any],
 	) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-		raw_vector = np.array([log1p(counts.get(op, 0)) for op in self.opcodes], dtype=float)
-		request_total = sum(max(float(counts.get(op, 0)), 0.0) for op in self.opcodes)
-		mix_denominator = request_total or 1.0
-		mix_vector = np.array(
-			[max(float(counts.get(op, 0)), 0.0) / mix_denominator for op in self.opcodes],
+		request_vector = np.array(
+			[max(float(counts.get(op, 0)), 0.0) for op in self.opcodes],
 			dtype=float,
 		)
-		total_value = np.log1p(request_total)
-
-		std_raw = (raw_vector - self.raw_mean) / self.raw_std
-		raw_dist = np.sqrt(((self.std_raw_matrix - std_raw) ** 2).mean(axis=1))
-		mix_dist = np.abs(self.mix_matrix - mix_vector).sum(axis=1)
-		total_dist = np.abs(self.total_vector - total_value) / self.total_std
-		combined = (
-			self.weights.raw * raw_dist
-			+ self.weights.normalized * mix_dist
-			+ self.weights.total * total_dist
-		)
+		raw_dist = np.sqrt(((self.count_matrix - request_vector) ** 2).sum(axis=1))
+		mix_dist = np.zeros_like(raw_dist)
+		total_dist = np.zeros_like(raw_dist)
+		combined = raw_dist
 		return combined, raw_dist, mix_dist, total_dist
 
 	def nearest_neighbor(self, base_index: int) -> InstructionNeighborResult:
@@ -119,4 +93,3 @@ class InstructionDistanceModel:
 
 def instruction_neighbor_results_to_dicts(results: list[InstructionNeighborResult]) -> list[dict[str, Any]]:
 	return [result.__dict__.copy() for result in results]
-

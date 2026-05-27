@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
 
-DEFAULT_DB = Path("experiments/exp_20260415_large_scale_5000cfg/experiments.db")
+DEFAULT_DB = Path(
+	os.environ.get(
+		"TWO_STEP_AUTOTUNING_DB",
+		"experiments/exp_20260415_large_scale_5000cfg/experiments.db",
+	)
+)
 
 
 def add_common_arguments(parser) -> None:
@@ -39,8 +45,10 @@ def add_live_arguments(parser) -> None:
 	parser.add_argument("--kernel", required=True, choices=["gemm", "gaussian"])
 	parser.add_argument("--input-size", required=True)
 	parser.add_argument("--output-dir", required=True)
+	parser.add_argument("--resolver-db", default=str(DEFAULT_DB))
 	parser.add_argument("--build-dir", default="build")
-	parser.add_argument("--runs-per-config", type=int, default=3)
+	parser.add_argument("--warmup-runs", type=int, default=5)
+	parser.add_argument("--runs-per-config", type=int, default=11)
 	parser.add_argument("--device-type", choices=["cpu", "gpu"], default="cpu")
 	parser.add_argument("--seed-record-count", type=int, default=1)
 	parser.add_argument("--random-seed", type=int, default=1)
@@ -59,8 +67,11 @@ def live_metadata(args, method: str) -> dict:
 		"kernel": args.kernel,
 		"input_size": args.input_size,
 		"output_dir": str(Path(args.output_dir)),
+		"resolver_db": args.resolver_db,
 		"build_dir": args.build_dir,
+		"warmup_runs": args.warmup_runs,
 		"runs_per_config": args.runs_per_config,
+		"runtime_statistic": "median",
 		"device_type": args.device_type,
 		"seed_record_count": args.seed_record_count,
 		"random_seed": args.random_seed,

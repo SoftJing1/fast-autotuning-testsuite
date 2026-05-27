@@ -11,7 +11,9 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
 	sys.path.insert(0, str(ROOT))
 
-from scripts.collect_tuning_performance_simple import KernelRunResult, run_kernel, run_kernel_average
+from scripts.collect_tuning_performance_simple import KernelRunResult, hash_config, run_kernel, run_kernel_average
+from scripts.collect_tuning_performance_simple import _parse_request, schedule_experiment_work
+from scripts.internal.db_manager import ExperimentDB
 
 
 def _build_dir() -> Path:
@@ -32,6 +34,22 @@ def _fetch_completed_rows(db_path: Path):
 			FROM experiments
 			WHERE status = 'completed'
 			ORDER BY exp_id ASC
+			"""
+		).fetchall()
+		return [dict(row) for row in rows]
+	finally:
+		conn.close()
+
+
+def _fetch_experiment_logs(db_path: Path):
+	conn = sqlite3.connect(str(db_path))
+	conn.row_factory = sqlite3.Row
+	try:
+		rows = conn.execute(
+			"""
+			SELECT exp_id, stage, level, message, payload_json
+			FROM experiment_logs
+			ORDER BY exp_id ASC, log_id ASC
 			"""
 		).fetchall()
 		return [dict(row) for row in rows]
@@ -88,6 +106,8 @@ def test_collect_db_runtime_matches_host_rerun(tmp_path, kernel_type: str, input
 
 	rows = [row for row in _fetch_completed_rows(db_path) if row["kernel_type"] == kernel_type]
 	assert rows, f"No completed {kernel_type} rows in database after collection"
+	log_rows = _fetch_experiment_logs(db_path)
+	assert log_rows, "Expected experiment logs after collection"
 
 	# Validate using database-stored config_json to rerun host and compare runtimes.
 	for row in rows:
@@ -117,6 +137,18 @@ def test_collect_db_runtime_matches_host_rerun(tmp_path, kernel_type: str, input
 			f"stored={stored_runtime:.6f}ms rerun={rerun_avg.runtime_ms:.6f}ms "
 			f"abs_diff={diff:.6f}ms rel_diff={rel_diff:.4f}"
 		)
+
+		exp_logs = [entry for entry in log_rows if entry["exp_id"] == row["exp_id"]]
+		assert any(entry["stage"] == "kernel_host" for entry in exp_logs)
+		raw_json_logs = [entry for entry in exp_logs if entry["stage"] == "symb_viewer_json"]
+		assert raw_json_logs, f"Expected raw symb-viewer JSON logs for exp_id={row['exp_id']}"
+		sources = {
+			json.loads(entry["payload_json"])["source_file"]
+			for entry in raw_json_logs
+			if entry["payload_json"]
+		}
+		assert "instrcount.json" in sources
+		assert "bbcount.json" in sources
 
 
 def test_run_kernel_average_uses_multiple_runs(monkeypatch):
@@ -168,3 +200,49 @@ def test_run_kernel_reports_missing_executable(tmp_path):
 	assert average.successful_runs == 0
 	assert len(average.errors) == 2
 	assert "Executable not found" in average.error_summary()
+
+
+def test_schedule_resume_reuses_existing_pending_row(tmp_path):
+	request = _parse_request("gaussian", "256x256", "1")
+	config_dir = tmp_path / "configs"
+	config_dir.mkdir(parents=True, exist_ok=True)
+	config_path = config_dir / "gaussian_256x256_000000.json"
+	config = {"input_size_h": 256, "input_size_w": 256, "wi_1_ocl_dim": 0, "wi_2_ocl_dim": 1, "wi_1": 2, "wi_2": 2, "wg_1_ocl_dim": 0, "wg_2_ocl_dim": 1, "wg_1": 64, "wg_2": 8}
+	config_path.write_text(json.dumps(config))
+
+	db_path = tmp_path / "experiments.db"
+	llvm_root = tmp_path / "llvm_ir"
+	param_hash = hash_config(config)
+	with ExperimentDB(str(db_path)) as db:
+		exp_id = db.add_experiment("gaussian", "256x256", param_hash, config, skip_if_exists=False)
+		assert exp_id is not None
+
+	scheduling = schedule_experiment_work(
+		resolved_configs=[(request, config_path)],
+		db_path=db_path,
+		llvm_root=llvm_root,
+		build_dir="build",
+		runs_per_config=1,
+		resume=True,
+		persist_artifacts=False,
+	)
+
+	assert scheduling.error_count == 0
+	assert len(scheduling.experiments) == 1
+	assert scheduling.experiments[0][0] == exp_id
+
+	with ExperimentDB(str(db_path)) as db:
+		assert db.mark_completed(exp_id, 1.23)
+
+	scheduling = schedule_experiment_work(
+		resolved_configs=[(request, config_path)],
+		db_path=db_path,
+		llvm_root=llvm_root,
+		build_dir="build",
+		runs_per_config=1,
+		resume=True,
+		persist_artifacts=False,
+	)
+
+	assert scheduling.error_count == 0
+	assert scheduling.experiments == []

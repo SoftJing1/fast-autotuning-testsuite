@@ -57,6 +57,7 @@ def test_run_formula_passes_substitution_file(tmp_path, monkeypatch):
 
 	def fake_run_symb_viewer(cmd):
 		calls.append(cmd)
+		return inst_count.SymbViewerInvocation(command=list(cmd), stdout="", stderr="", returncode=0)
 
 	monkeypatch.setattr(inst_count, "_run_symb_viewer", fake_run_symb_viewer)
 
@@ -80,6 +81,26 @@ def test_run_formula_passes_substitution_file(tmp_path, monkeypatch):
 	subs_arg = next(arg for arg in calls[0] if arg.startswith("-subs="))
 	subs_path = Path(subs_arg.removeprefix("-subs="))
 	assert json.loads(subs_path.read_text()) == {"call_ret__Z12get_group_idj": 0}
+
+
+def test_inst_count_result_to_dict_includes_raw_json():
+	result = inst_count.InstCountResult(
+		llvm_ir_path="kernel.ll",
+		kernel_function="gemm_1",
+		bb_counts={"entry": 1},
+		bb_instruction_counts={"entry": {"add": 2}},
+		total_instruction_counts={"add": 2},
+		raw_instr_count_json=[{"block_name": "entry", "instruction_counts": {"add": 2}}],
+		raw_bb_count_json={"basic_graphs": [{"graph_type": "BasicBlock", "name": "entry", "count": "1"}]},
+		symb_viewer_invocations=(),
+	)
+
+	payload = result.to_dict()
+
+	assert payload["raw_instr_count_json"] == [{"block_name": "entry", "instruction_counts": {"add": 2}}]
+	assert payload["raw_bb_count_json"] == {
+		"basic_graphs": [{"graph_type": "BasicBlock", "name": "entry", "count": "1"}]
+	}
 
 
 def test_symbolic_basic_block_count_is_not_silently_negative():

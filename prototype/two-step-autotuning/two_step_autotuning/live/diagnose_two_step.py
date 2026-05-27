@@ -5,29 +5,17 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ..core.common_args import DEFAULT_DB
+from ..core.dataset import TuningDataset
 from ..core.instruction_space import (
 	INST_INDEX_PREFIX,
-	build_instruction_parameter_specs_from_profiles,
+	build_instruction_parameter_specs,
 	counts_from_tuning_indices,
-	median_instruction_counts,
 	nearest_indices_from_counts,
 )
-from ..core.resolver import OnlineInstructionMapResolver, ResolverWeights
+from ..core.resolver import DatabaseApproxInstructionMapResolver, ResolverWeights
 from .config_space import LiveConfigGenerator
 from .executor import LiveKernelExecutor, check_instruction_counter_available
-
-
-def _profile_new_configs(
-	generator: LiveConfigGenerator,
-	executor: LiveKernelExecutor,
-	count: int,
-) -> list:
-	profiles = []
-	for config in generator.generate(count):
-		result = executor.profile_config(config)
-		if result.valid and result.profile is not None:
-			profiles.append(result.profile)
-	return profiles
 
 
 def _next_index_config(start_index_config: dict[str, int], specs: dict) -> dict[str, int]:
@@ -71,36 +59,35 @@ def run_diagnostic(args) -> dict[str, Any]:
 		build_dir=args.build_dir,
 		runs_per_config=args.runs_per_config,
 	)
-	bootstrap_profiles = _profile_new_configs(generator, executor, args.bootstrap_profile_count)
-	if not bootstrap_profiles:
-		raise RuntimeError("diagnostic could not produce any bootstrap profiles")
-
-	specs = build_instruction_parameter_specs_from_profiles(
-		bootstrap_profiles,
+	dataset = TuningDataset(Path(args.resolver_db), args.kernel, args.input_size)
+	specs = build_instruction_parameter_specs(
+		dataset,
 		max_values_per_op=args.max_values_per_op,
 	)
 	if not specs:
-		raise RuntimeError("bootstrap profiles produced no varying instruction-map parameters")
+		raise RuntimeError("resolver dataset produced no varying instruction-map parameters")
+	start_result = executor.profile_config(generator.generate(1)[0])
+	if not start_result.valid or start_result.profile is None:
+		raise RuntimeError("diagnostic could not profile the shared start config")
+	start_profile = start_result.profile
 
-	resolver = OnlineInstructionMapResolver(
+	resolver = DatabaseApproxInstructionMapResolver(
+		dataset,
 		weights=ResolverWeights(
 			raw=args.raw_weight,
 			normalized=args.normalized_weight,
 			total=args.total_weight,
-		)
+		),
 	)
-	resolver.add_profiles(bootstrap_profiles)
-	resolver.add_profiles(_profile_new_configs(generator, executor, args.resolver_candidate_limit))
 
-	start_profile = bootstrap_profiles[0]
 	start_index_config = nearest_indices_from_counts(start_profile.raw_counts, specs)
 	next_index_config = _next_index_config(start_index_config, specs)
-	default_counts = median_instruction_counts(bootstrap_profiles)
+	default_counts = dataset.median_instruction_counts()
 	requested_counts = dict(default_counts)
 	requested_counts.update(counts_from_tuning_indices(next_index_config, specs))
 
 	resolution = resolver.resolve(requested_counts)
-	if not resolution.valid or resolution.profile is None:
+	if not resolution.valid or resolution.record is None:
 		payload = {
 			"status": "resolver_invalid",
 			"requested_instruction_map": requested_counts,
@@ -115,7 +102,7 @@ def run_diagnostic(args) -> dict[str, Any]:
 			},
 		}
 	else:
-		execution = executor.execute_config(resolution.profile.config)
+		execution = executor.execute_config(resolution.record.config)
 		if not execution.valid or execution.profile is None:
 			raise RuntimeError(f"resolved config failed execution: {execution.error_msg}")
 		payload = {
@@ -124,16 +111,14 @@ def run_diagnostic(args) -> dict[str, Any]:
 			"input_size": args.input_size,
 			"encoding": "online_instruction_value_index",
 			"distance_metric": {
-				"combined": "raw_weight * standardized_log_count_l2_mean + normalized_weight * opcode_mix_l1 + total_weight * log_total_abs",
-				"raw_weight": args.raw_weight,
-				"normalized_weight": args.normalized_weight,
-				"total_weight": args.total_weight,
+				"name": "euclidean",
+				"vector": "per-op raw instruction counts",
 			},
+			"instruction_space_source": "resolver_dataset_full",
 			"representative_values_by_opcode": {
 				op: list(spec.values)
 				for op, spec in sorted(specs.items())
 			},
-			"bootstrap_profiles": [_compact_profile(profile) for profile in bootstrap_profiles],
 			"starting_seed": {
 				"index_config": start_index_config,
 				"profile": _compact_profile(start_profile),
@@ -143,7 +128,7 @@ def run_diagnostic(args) -> dict[str, Any]:
 				"requested_instruction_map": dict(sorted(requested_counts.items())),
 			},
 			"resolved_best_close_config": {
-				"profile_before_execution": _compact_profile(resolution.profile),
+				"profile_before_execution": _compact_profile(resolution.record),
 				"executed_profile": _compact_profile(execution.profile),
 				"resolver_result": {
 					"status": resolution.status,
@@ -170,12 +155,11 @@ def build_argparser() -> argparse.ArgumentParser:
 	parser.add_argument("--kernel", required=True, choices=["gemm", "gaussian"])
 	parser.add_argument("--input-size", required=True)
 	parser.add_argument("--output-dir", required=True)
+	parser.add_argument("--resolver-db", default=str(DEFAULT_DB))
 	parser.add_argument("--build-dir", default="build")
 	parser.add_argument("--runs-per-config", type=int, default=1)
 	parser.add_argument("--device-type", choices=["cpu", "gpu"], default="cpu")
 	parser.add_argument("--random-seed", type=int, default=1)
-	parser.add_argument("--bootstrap-profile-count", type=int, default=8)
-	parser.add_argument("--resolver-candidate-limit", type=int, default=4)
 	parser.add_argument("--max-values-per-op", type=int, default=12)
 	parser.add_argument("--raw-weight", type=float, default=0.4)
 	parser.add_argument("--normalized-weight", type=float, default=0.5)

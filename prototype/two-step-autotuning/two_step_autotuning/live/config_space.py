@@ -2,35 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
 from typing import Any, Iterator
-
-from opentuner.search.manipulator import ConfigurationManipulator, IntegerParameter
 
 from scripts.collect_tuning_performance_simple import _device_limits, _load_config_generator_modules
 
 from ..core.instruction_map import canonical_config_key
-
-
-LIVE_CONFIG_INDEX = "config_index"
-
-
-@dataclass(frozen=True)
-class LiveConfigPool:
-	kernel_type: str
-	input_size: str
-	configs: tuple[dict[str, Any], ...]
-
-	def manipulator(self) -> ConfigurationManipulator:
-		manipulator = ConfigurationManipulator()
-		manipulator.add_parameter(IntegerParameter(LIVE_CONFIG_INDEX, 0, len(self.configs) - 1))
-		return manipulator
-
-	def config_from_values(self, values: dict[str, Any]) -> dict[str, Any]:
-		return self.configs[int(values[LIVE_CONFIG_INDEX])]
-
-	def seed_configurations(self, count: int) -> list[dict[str, int]]:
-		return [{LIVE_CONFIG_INDEX: index} for index in range(min(count, len(self.configs)))]
 
 
 class LiveConfigGenerator:
@@ -60,6 +36,8 @@ class LiveConfigGenerator:
 			batch_size = max(needed * 2, 8)
 			for config in self._sample_upper_configs(batch_size, attempt_round):
 				host_config = self._to_host_config(config)
+				if not self.validate_config(host_config):
+					continue
 				key = canonical_config_key(host_config)
 				if key in self._generated_keys:
 					continue
@@ -71,13 +49,6 @@ class LiveConfigGenerator:
 			if attempt_round > 100 and not configs:
 				raise RuntimeError("failed to generate any valid configs")
 		return configs
-
-	def build_pool(self, count: int) -> LiveConfigPool:
-		return LiveConfigPool(
-			kernel_type=self.kernel_type,
-			input_size=self.input_size,
-			configs=tuple(self.generate(count)),
-		)
 
 	def _sample_upper_configs(self, count: int, attempt_round: int) -> Iterator[dict[str, Any]]:
 		max_wi_size, max_wg_size = _device_limits(self.device_type)
@@ -118,6 +89,33 @@ class LiveConfigGenerator:
 			host_config["N"] = n
 			host_config["K"] = k
 		return host_config
+
+	def fixed_input_config(self) -> dict[str, int]:
+		if self.kernel_type == "gaussian":
+			h, w = self._dims
+			return {
+				"input_size_h": h,
+				"input_size_w": w,
+			}
+		m, n, k = self._dims
+		return {
+			"M": m,
+			"N": n,
+			"K": k,
+		}
+
+	def validate_config(self, host_config: dict[str, Any]) -> bool:
+		max_wi_size, max_wg_size = _device_limits(self.device_type)
+		module = self.modules[self.kernel_type]
+		upper_config = self._to_upper_config(host_config)
+		return bool(module.is_configuration_valid(upper_config, max_wi_size, max_wg_size))
+
+	def _to_upper_config(self, host_config: dict[str, Any]) -> dict[str, int]:
+		return {
+			key.upper(): int(value)
+			for key, value in host_config.items()
+			if key not in {"input_size_h", "input_size_w", "M", "N", "K"}
+		}
 
 
 def hash_config(config: dict[str, Any]) -> str:

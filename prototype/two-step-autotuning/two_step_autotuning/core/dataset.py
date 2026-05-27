@@ -142,7 +142,9 @@ class TuningDataset:
 		return rng.sample(self.records, count)
 
 	def median_instruction_counts(self) -> dict[str, int]:
+		from .instruction_space import filter_instruction_opcodes
+
 		return {
 			op: int(median(int(record.raw_counts.get(op, 0)) for record in self.records))
-			for op in self.opcodes
+			for op in filter_instruction_opcodes(self.opcodes)
 		}

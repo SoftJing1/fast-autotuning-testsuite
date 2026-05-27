@@ -153,7 +153,7 @@ def build_argparser():
 	parser.add_argument(
 		"--parameter-distance-metric",
 		choices=PARAMETER_DISTANCE_METRICS,
-		default="ordinal",
+		default="euclidean",
 		help="Distance metric used by --parameter-resolver approx.",
 	)
 	parser.add_argument(

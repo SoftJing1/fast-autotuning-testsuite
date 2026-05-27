@@ -28,6 +28,8 @@ class LiveProfile:
 	config: dict[str, Any]
 	raw_counts: dict[str, int]
 	runtime_ms: float | None = None
+	warmup_runtimes_ms: tuple[float, ...] = ()
+	measured_runtimes_ms: tuple[float, ...] = ()
 
 	@property
 	def total_count(self) -> int:

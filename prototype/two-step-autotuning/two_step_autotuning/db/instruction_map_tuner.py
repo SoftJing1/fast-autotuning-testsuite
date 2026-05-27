@@ -55,6 +55,7 @@ class InstructionMapTuningInterface(MeasurementInterface):
 				"valid_config_limit": args.valid_config_limit,
 				"opcodes": sorted(self.parameter_specs),
 				"encoding": "observed_value_index",
+				"distance_metric": "euclidean_instruction_count_vector",
 				"instruction_value_counts": {
 					op: len(spec.values)
 					for op, spec in sorted(self.parameter_specs.items())

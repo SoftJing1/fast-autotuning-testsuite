@@ -29,6 +29,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from multiprocessing import Pool, cpu_count
@@ -61,6 +62,7 @@ DEFAULT_EXPERIMENT_ROOT = "experiments"
 DEFAULT_DB_FILENAME = "experiments.db"
 DEFAULT_BUILD_DIR = "build"
 DEFAULT_RUNS_PER_CONFIG = 3
+DEFAULT_PERSIST_ARTIFACTS = False
 MAX_ERROR_MESSAGE_LEN = 4000
 
 KERNEL_TEMPLATE_SPECS = {
@@ -119,6 +121,7 @@ class KernelAverageResult:
 	successful_runs: int
 	attempted_runs: int
 	errors: Tuple[str, ...] = ()
+	run_results: Tuple[KernelRunResult, ...] = ()
 
 	@property
 	def success(self) -> bool:
@@ -134,7 +137,7 @@ class KernelAverageResult:
 @dataclass(frozen=True)
 class SchedulingResult:
 	"""Experiment work items plus count of configs that could not be scheduled."""
-	experiments: List[Tuple[int, str, str, str, str, str, int]]
+	experiments: List[Tuple[int, str, str, str, str, str, int, bool]]
 	error_count: int
 
 
@@ -254,6 +257,7 @@ def run_kernel_average(
 
 	runtimes: List[float] = []
 	errors: List[str] = []
+	run_results: List[KernelRunResult] = []
 	for run_index in range(1, runs_per_config + 1):
 		result = run_kernel(
 			kernel_type,
@@ -261,6 +265,7 @@ def run_kernel_average(
 			build_dir=build_dir,
 			dump_opencl_binary=dump_opencl_binary,
 		)
+		run_results.append(result)
 		if result.success and result.runtime_ms is not None:
 			runtimes.append(result.runtime_ms)
 			continue
@@ -278,6 +283,7 @@ def run_kernel_average(
 			successful_runs=0,
 			attempted_runs=runs_per_config,
 			errors=tuple(errors),
+			run_results=tuple(run_results),
 		)
 
 	return KernelAverageResult(
@@ -285,6 +291,7 @@ def run_kernel_average(
 		successful_runs=len(runtimes),
 		attempted_runs=runs_per_config,
 		errors=tuple(errors),
+		run_results=tuple(run_results),
 	)
 
 
@@ -312,11 +319,13 @@ def runtime_ir_artifacts_from_dump(
 	param_hash: str,
 	llvm_output_dir: Path,
 	opencl_binary_path: Path,
+	persist_artifacts: bool,
 ) -> List[Dict[str, str]]:
 	"""Convert a host-dumped OpenCL binary into runtime LLVM IR artifact records."""
 	size_str = _kernel_size_string(kernel_type, config_dict)
 	output_ll = llvm_output_dir / f"{kernel_type}_{size_str}_{param_hash}_runtime.ll"
 	extract_opencl_runtime_ir(opencl_binary_path, output_ll)
+	artifact_ref = str(output_ll) if persist_artifacts else f"transient://{output_ll.name}"
 
 	artifacts: List[Dict[str, str]] = []
 	for spec in KERNEL_TEMPLATE_SPECS.get(kernel_type, []):
@@ -326,7 +335,7 @@ def runtime_ir_artifacts_from_dump(
 				"template_name": spec["template_name"],
 				"kernel_function": kernel_function,
 				"llvm_ir_path": str(output_ll),
-				"opencl_binary_path": str(opencl_binary_path),
+				"llvm_ir_ref": artifact_ref,
 			}
 		)
 	return artifacts
@@ -594,11 +603,17 @@ def _schedule_single_experiment(
 	build_dir: str,
 	runs_per_config: int,
 	resume: bool,
-) -> Optional[Tuple[int, str, str, str, str, str, int]]:
+	persist_artifacts: bool,
+) -> Optional[Tuple[int, str, str, str, str, str, int, bool]]:
 	with open(config_file) as f:
 		config = json.load(f)
 
 	param_hash = hash_config(config)
+	existing = db.get_experiment_by_key(
+		kernel_type=request.kernel_type,
+		input_size=request.size_string,
+		param_hash=param_hash,
+	)
 	exp_id = db.add_experiment(
 		kernel_type=request.kernel_type,
 		input_size=request.size_string,
@@ -608,7 +623,9 @@ def _schedule_single_experiment(
 	)
 
 	if exp_id is None:
-		return None
+		if not resume or existing is None or existing.status != "pending":
+			return None
+		exp_id = existing.exp_id
 
 	return (
 		exp_id,
@@ -618,6 +635,7 @@ def _schedule_single_experiment(
 		str(llvm_root),
 		build_dir,
 		runs_per_config,
+		persist_artifacts,
 	)
 
 
@@ -628,9 +646,10 @@ def schedule_experiment_work(
 	build_dir: str,
 	runs_per_config: int,
 	resume: bool,
+	persist_artifacts: bool,
 ) -> SchedulingResult:
 	"""Create DB rows and worker arguments for configs that are ready to run."""
-	experiments: List[Tuple[int, str, str, str, str, str, int]] = []
+	experiments: List[Tuple[int, str, str, str, str, str, int, bool]] = []
 	error_count = 0
 
 	with ExperimentDB(str(db_path)) as db:
@@ -645,6 +664,7 @@ def schedule_experiment_work(
 					build_dir=build_dir,
 					runs_per_config=runs_per_config,
 					resume=resume,
+					persist_artifacts=persist_artifacts,
 				)
 			except Exception as exc:
 				error_count += 1
@@ -660,15 +680,103 @@ def schedule_experiment_work(
 	return SchedulingResult(experiments=experiments, error_count=error_count)
 
 
-def _worker_failure(db: ExperimentDB, exp_id: int, error_msg: str) -> Tuple[int, bool, str]:
+def _record_db_log(
+	db: ExperimentDB,
+	exp_id: int,
+	stage: str,
+	level: str,
+	message: str,
+	payload: Optional[Dict[str, object]] = None,
+) -> None:
+	try:
+		db.add_experiment_log(
+			exp_id=exp_id,
+			stage=stage,
+			level=level,
+			message=_truncate_error(message),
+			payload=payload,
+		)
+	except Exception as exc:
+		print(
+			f"Warning: failed to store log for exp_id={exp_id}: {_format_exception(exc)}",
+			file=sys.stderr,
+		)
+
+
+def _kernel_run_result_payload(run_index: int, result: KernelRunResult) -> Dict[str, object]:
+	return {
+		"run_index": run_index,
+		"runtime_ms": result.runtime_ms,
+		"success": result.success,
+		"error_msg": result.error_msg,
+		"returncode": result.returncode,
+		"stdout_tail": result.stdout_tail,
+		"stderr_tail": result.stderr_tail,
+	}
+
+
+def _record_runtime_execution_summary(
+	db: ExperimentDB,
+	exp_id: int,
+	kernel_type: str,
+	config_file: str,
+	build_dir: str,
+	runs_per_config: int,
+	runtime_result: KernelAverageResult,
+	persist_artifacts: bool,
+) -> None:
+	run_payload = [
+		_kernel_run_result_payload(run_index, result)
+		for run_index, result in enumerate(runtime_result.run_results, start=1)
+	]
+	message = (
+		f"Host execution summary for {kernel_type}: "
+		f"{runtime_result.successful_runs}/{runtime_result.attempted_runs} successful run(s)."
+	)
+	_record_db_log(
+		db,
+		exp_id,
+		"kernel_host",
+		"info" if runtime_result.success else "warning",
+		message,
+		payload={
+			"kernel_type": kernel_type,
+			"config_file": config_file,
+			"build_dir": build_dir,
+			"runs_per_config": runs_per_config,
+			"successful_runs": runtime_result.successful_runs,
+			"attempted_runs": runtime_result.attempted_runs,
+			"average_runtime_ms": runtime_result.runtime_ms,
+			"errors": list(runtime_result.errors),
+			"persist_artifacts": persist_artifacts,
+			"runs": run_payload,
+		},
+	)
+
+
+def _worker_failure(
+	db: ExperimentDB,
+	exp_id: int,
+	error_msg: str,
+	stage: str,
+	payload: Optional[Dict[str, object]] = None,
+) -> Tuple[int, bool, str]:
 	error_msg = _truncate_error(error_msg)
+	_record_db_log(db, exp_id, stage, "error", error_msg, payload=payload)
 	db.mark_failed(exp_id, error_msg)
 	return (exp_id, False, error_msg)
 
 
-def _mark_failed_from_exception(db_path: str, exp_id: int, error_msg: str) -> None:
+def _mark_failed_from_exception(
+	db_path: str,
+	exp_id: int,
+	error_msg: str,
+	stage: str = "collector",
+	payload: Optional[Dict[str, object]] = None,
+) -> None:
 	try:
 		with ExperimentDB(db_path) as db:
+			_record_db_log(db, exp_id, stage, "error", error_msg, payload=payload)
 			db.mark_failed(exp_id, error_msg)
 	except Exception:
 		pass
@@ -680,6 +788,7 @@ def _extract_runtime_ir_result(
 	param_hash: str,
 	llvm_output_dir: Path,
 	opencl_binary_path: Path,
+	persist_artifacts: bool,
 ) -> RuntimeIRResult:
 	try:
 		artifacts = runtime_ir_artifacts_from_dump(
@@ -688,6 +797,7 @@ def _extract_runtime_ir_result(
 			param_hash,
 			llvm_output_dir,
 			opencl_binary_path,
+			persist_artifacts=persist_artifacts,
 		)
 	except Exception as exc:
 		return RuntimeIRResult(
@@ -702,18 +812,6 @@ def _extract_runtime_ir_result(
 		)
 
 	return RuntimeIRResult(artifacts=artifacts)
-
-
-def _runtime_diagnostics(runtime_result: KernelAverageResult) -> List[str]:
-	if not runtime_result.errors:
-		return []
-	return [
-		_truncate_error(
-			f"Kernel produced {runtime_result.successful_runs}/"
-			f"{runtime_result.attempted_runs} successful run(s); ignored failed runs: "
-			f"{runtime_result.error_summary()}"
-		)
-	]
 
 
 def _store_symbolic_instruction_counts(
@@ -732,10 +830,55 @@ def _store_symbolic_instruction_counts(
 				exp_id=exp_id,
 				template_name=artifact["template_name"],
 				kernel_function=artifact["kernel_function"],
-				llvm_ir_path=artifact["llvm_ir_path"],
+				llvm_ir_path=artifact["llvm_ir_ref"],
 				bb_counts=inst_result.bb_counts,
 				bb_instruction_counts=inst_result.bb_instruction_counts,
 				total_instruction_counts=inst_result.total_instruction_counts,
+			)
+			for invocation in inst_result.symb_viewer_invocations:
+				_record_db_log(
+					db,
+					exp_id,
+					"symb_viewer",
+					"info",
+					f"symb-viewer completed for template={artifact['template_name']} command={' '.join(invocation.command)}",
+					payload={
+						"template_name": artifact["template_name"],
+						"kernel_function": artifact["kernel_function"],
+						"llvm_ir_ref": artifact["llvm_ir_ref"],
+						"command": invocation.command,
+						"returncode": invocation.returncode,
+						"stdout": invocation.stdout,
+						"stderr": invocation.stderr,
+					},
+				)
+			_record_db_log(
+				db,
+				exp_id,
+				"symb_viewer_json",
+				"info",
+				f"Stored raw symb-viewer inst-count JSON for template={artifact['template_name']}",
+				payload={
+					"template_name": artifact["template_name"],
+					"kernel_function": artifact["kernel_function"],
+					"llvm_ir_ref": artifact["llvm_ir_ref"],
+					"source_file": "instrcount.json",
+					"json_payload": inst_result.raw_instr_count_json,
+				},
+			)
+			_record_db_log(
+				db,
+				exp_id,
+				"symb_viewer_json",
+				"info",
+				f"Stored raw symb-viewer bb-count JSON for template={artifact['template_name']}",
+				payload={
+					"template_name": artifact["template_name"],
+					"kernel_function": artifact["kernel_function"],
+					"llvm_ir_ref": artifact["llvm_ir_ref"],
+					"source_file": "bbcount.json",
+					"json_payload": inst_result.raw_bb_count_json,
+				},
 			)
 		except Exception as exc:
 			errors.append(
@@ -747,34 +890,55 @@ def _store_symbolic_instruction_counts(
 	return errors
 
 
-def _symbolic_diagnostics(symbolic_errors: Sequence[str], artifact_count: int) -> List[str]:
-	if not symbolic_errors:
-		return []
-	return [
-		_truncate_error(
+def _record_worker_diagnostics(
+	db: ExperimentDB,
+	exp_id: int,
+	runtime_result: KernelAverageResult,
+	symbolic_errors: Sequence[str],
+	artifact_count: int,
+	persist_artifacts: bool,
+) -> None:
+	diagnostics: List[str] = []
+
+	if runtime_result.errors:
+		message = (
+			f"Kernel produced {runtime_result.successful_runs}/"
+			f"{runtime_result.attempted_runs} successful run(s); ignored failed runs."
+		)
+		payload = {
+			"successful_runs": runtime_result.successful_runs,
+			"attempted_runs": runtime_result.attempted_runs,
+			"errors": list(runtime_result.errors),
+		}
+		_record_db_log(db, exp_id, "runtime", "warning", message, payload=payload)
+		diagnostics.append(f"{message} {runtime_result.error_summary()}")
+
+	if symbolic_errors:
+		message = (
 			"Symbolic instruction-count extraction failed for "
-			f"{len(symbolic_errors)}/{artifact_count} artifact(s): "
-			+ " | ".join(symbolic_errors)
+			f"{len(symbolic_errors)}/{artifact_count} artifact(s)."
 		)
-	]
+		payload = {
+			"artifact_count": artifact_count,
+			"errors": list(symbolic_errors),
+			"persist_artifacts": persist_artifacts,
+		}
+		_record_db_log(db, exp_id, "symbolic_counts", "warning", message, payload=payload)
+		diagnostics.append(message + " " + " | ".join(symbolic_errors))
+
+	if diagnostics:
+		warning = _truncate_error(" ".join(diagnostics))
+		try:
+			db.record_error_message(exp_id, warning)
+		except Exception as exc:
+			print(
+				f"Warning: failed to store diagnostic for exp_id={exp_id}: {_format_exception(exc)}",
+				file=sys.stderr,
+			)
+		print(f"Warning: exp_id={exp_id}: {warning}", file=sys.stderr)
 
 
-def _record_worker_diagnostics(db: ExperimentDB, exp_id: int, diagnostics: Sequence[str]) -> None:
-	if not diagnostics:
-		return
-
-	warning = _truncate_error(" ".join(diagnostics))
-	try:
-		db.record_error_message(exp_id, warning)
-	except Exception as exc:
-		print(
-			f"Warning: failed to store diagnostic for exp_id={exp_id}: {_format_exception(exc)}",
-			file=sys.stderr,
-		)
-	print(f"Warning: exp_id={exp_id}: {warning}", file=sys.stderr)
-
-
-def process_single_experiment(args: Tuple[int, str, str, str, str, str, int]) -> Tuple[int, bool, str]:
+def process_single_experiment(args: Tuple[int, str, str, str, str, str, int, bool]) -> Tuple[int, bool, str]:
 	"""Process single experiment in worker process."""
 	(
 		exp_id,
@@ -784,8 +948,10 @@ def process_single_experiment(args: Tuple[int, str, str, str, str, str, int]) ->
 		llvm_output_dir,
 		build_dir,
 		runs_per_config,
+		persist_artifacts,
 	) = args
 
+	artifact_tempdir: Optional[tempfile.TemporaryDirectory[str]] = None
 	try:
 		with ExperimentDB(db_path) as db:
 			with open(config_file) as f:
@@ -793,7 +959,12 @@ def process_single_experiment(args: Tuple[int, str, str, str, str, str, int]) ->
 
 			param_hash = hash_config(config)
 			size_str = _kernel_size_string(kernel_type, config)
-			opencl_binary_path = Path(llvm_output_dir) / f"{kernel_type}_{size_str}_{param_hash}.opencl.bin"
+			if persist_artifacts:
+				artifact_root = Path(llvm_output_dir)
+			else:
+				artifact_tempdir = tempfile.TemporaryDirectory(prefix="collect_artifacts_")
+				artifact_root = Path(artifact_tempdir.name)
+			opencl_binary_path = artifact_root / f"{kernel_type}_{size_str}_{param_hash}.opencl.bin"
 
 			runtime_result = run_kernel_average(
 				kernel_type,
@@ -802,45 +973,119 @@ def process_single_experiment(args: Tuple[int, str, str, str, str, str, int]) ->
 				runs_per_config=runs_per_config,
 				dump_opencl_binary=str(opencl_binary_path),
 			)
+			_record_runtime_execution_summary(
+				db=db,
+				exp_id=exp_id,
+				kernel_type=kernel_type,
+				config_file=config_file,
+				build_dir=build_dir,
+				runs_per_config=runs_per_config,
+				runtime_result=runtime_result,
+				persist_artifacts=persist_artifacts,
+			)
 			if not runtime_result.success or runtime_result.runtime_ms is None:
 				return _worker_failure(
 					db,
 					exp_id,
 					f"Execution failed across {runs_per_config} run(s): "
 					f"{runtime_result.error_summary()}",
+					stage="runtime",
+					payload={
+						"successful_runs": runtime_result.successful_runs,
+						"attempted_runs": runtime_result.attempted_runs,
+						"errors": list(runtime_result.errors),
+					},
 				)
 
 			ir_result = _extract_runtime_ir_result(
 				kernel_type,
 				config,
 				param_hash,
-				Path(llvm_output_dir),
+				artifact_root,
 				opencl_binary_path,
+				persist_artifacts=persist_artifacts,
 			)
 			if not ir_result.success:
-				return _worker_failure(db, exp_id, ir_result.error_msg or "Runtime LLVM IR extraction failed")
+				return _worker_failure(
+					db,
+					exp_id,
+					ir_result.error_msg or "Runtime LLVM IR extraction failed",
+					stage="runtime_ir",
+					payload={"persist_artifacts": persist_artifacts},
+				)
+			_record_db_log(
+				db,
+				exp_id,
+				"runtime_ir",
+				"info",
+				f"Runtime IR extraction produced {len(ir_result.artifacts)} artifact(s).",
+				payload={
+					"persist_artifacts": persist_artifacts,
+					"artifacts": [
+						{
+							"template_name": artifact["template_name"],
+							"kernel_function": artifact["kernel_function"],
+							"llvm_ir_ref": artifact["llvm_ir_ref"],
+						}
+						for artifact in ir_result.artifacts
+					],
+				},
+			)
 
 			db.mark_completed(
 				exp_id,
 				runtime_result.runtime_ms,
-				_serialize_llvm_paths([artifact["llvm_ir_path"] for artifact in ir_result.artifacts]),
+				_serialize_llvm_paths([artifact["llvm_ir_ref"] for artifact in ir_result.artifacts])
+				if persist_artifacts else None,
 			)
 
 			symbolic_errors = _store_symbolic_instruction_counts(db, exp_id, ir_result.artifacts)
-			diagnostics = (
-				_runtime_diagnostics(runtime_result)
-				+ _symbolic_diagnostics(symbolic_errors, len(ir_result.artifacts))
+			_record_worker_diagnostics(
+				db=db,
+				exp_id=exp_id,
+				runtime_result=runtime_result,
+				symbolic_errors=symbolic_errors,
+				artifact_count=len(ir_result.artifacts),
+				persist_artifacts=persist_artifacts,
 			)
-			_record_worker_diagnostics(db, exp_id, diagnostics)
+			_record_db_log(
+				db,
+				exp_id,
+				"collector",
+				"info",
+				"Collected runtime and symbolic instruction counts.",
+				payload={
+					"runtime_ms": runtime_result.runtime_ms,
+					"successful_runs": runtime_result.successful_runs,
+					"attempted_runs": runtime_result.attempted_runs,
+					"artifact_count": len(ir_result.artifacts),
+					"persist_artifacts": persist_artifacts,
+					"templates": [artifact["template_name"] for artifact in ir_result.artifacts],
+				},
+			)
 
 		return (exp_id, True, "")
 	except Exception as exc:
 		error_msg = _format_exception(exc)
-		_mark_failed_from_exception(db_path, exp_id, error_msg)
+		_mark_failed_from_exception(
+			db_path,
+			exp_id,
+			error_msg,
+			stage="collector",
+			payload={"persist_artifacts": persist_artifacts},
+		)
 		return (exp_id, False, error_msg)
+	finally:
+		if artifact_tempdir is not None:
+			artifact_tempdir.cleanup()
 
 
-def _build_experiment_directory(root_dir: str, experiment_name: Optional[str], resume: bool) -> Path:
+def _build_experiment_directory(
+	root_dir: str,
+	experiment_name: Optional[str],
+	resume: bool,
+	persist_artifacts: bool,
+) -> Path:
 	root = Path(root_dir)
 	root.mkdir(parents=True, exist_ok=True)
 	name = experiment_name or datetime.now().strftime("exp_%Y%m%d_%H%M%S")
@@ -851,7 +1096,8 @@ def _build_experiment_directory(root_dir: str, experiment_name: Optional[str], r
 		)
 	run_dir.mkdir(parents=True, exist_ok=True)
 	(run_dir / "configs").mkdir(parents=True, exist_ok=True)
-	(run_dir / "llvm_ir").mkdir(parents=True, exist_ok=True)
+	if persist_artifacts:
+		(run_dir / "llvm_ir").mkdir(parents=True, exist_ok=True)
 	_ensure_visualization_launcher(run_dir)
 	return run_dir
 
@@ -899,6 +1145,7 @@ def collect_experiments(
 	seed: int,
 	build_dir: str,
 	runs_per_config: int,
+	persist_artifacts: bool,
 ) -> int:
 	"""Main collection pipeline from request tuples."""
 	if num_workers is None:
@@ -908,7 +1155,12 @@ def collect_experiments(
 	if runs_per_config <= 0:
 		raise ValueError("runs_per_config must be > 0")
 
-	run_dir = _build_experiment_directory(experiment_root, experiment_name, resume=resume)
+	run_dir = _build_experiment_directory(
+		experiment_root,
+		experiment_name,
+		resume=resume,
+		persist_artifacts=persist_artifacts,
+	)
 	configs_root = run_dir / "configs"
 	llvm_root = run_dir / "llvm_ir"
 	db_path = run_dir / DEFAULT_DB_FILENAME
@@ -918,11 +1170,12 @@ def collect_experiments(
 	print(f"Experiment dir: {run_dir}")
 	print(f"Database:       {db_path}")
 	print(f"Configs root:   {configs_root}")
-	print(f"LLVM IR root:   {llvm_root}")
+	print(f"Artifact store: {llvm_root if persist_artifacts else 'transient worker tempdirs only'}")
 	print(f"Build dir:      {build_dir}")
 	print(f"Runs/config:    {runs_per_config}")
 	print(f"Workers:        {num_workers}")
 	print(f"Resume:         {resume}")
+	print(f"Persist files:  {persist_artifacts}")
 	print("Requests:")
 	for req in requests:
 		print(f"  - {req.kernel_type:8s} {req.size_string:14s} {req.total_configs:7d}")
@@ -934,6 +1187,7 @@ def collect_experiments(
 		"seed": seed,
 		"build_dir": build_dir,
 		"runs_per_config": runs_per_config,
+		"persist_artifacts": persist_artifacts,
 		"requests": [
 			{
 				"kernel_type": req.kernel_type,
@@ -961,6 +1215,7 @@ def collect_experiments(
 			build_dir=build_dir,
 			runs_per_config=runs_per_config,
 			resume=resume,
+			persist_artifacts=persist_artifacts,
 		)
 		experiments = scheduling.experiments
 
@@ -1106,6 +1361,11 @@ def main() -> int:
 		default=DEFAULT_BUILD_DIR,
 		help=f"Directory containing kernel executables (default: {DEFAULT_BUILD_DIR})",
 	)
+	parser.add_argument(
+		"--persist-artifacts",
+		action="store_true",
+		help="Keep dumped OpenCL binaries and runtime LLVM IR files under the experiment directory.",
+	)
 
 	args = parser.parse_args()
 
@@ -1139,6 +1399,7 @@ def main() -> int:
 		seed=args.seed,
 		build_dir=args.build_dir,
 		runs_per_config=args.runs_per_config,
+		persist_artifacts=args.persist_artifacts,
 	)
 
 

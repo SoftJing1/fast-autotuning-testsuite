@@ -101,6 +101,7 @@ class ExperimentDB:
 				"""
 			)
 			self._ensure_llvm_instruction_counts_schema()
+			self._ensure_experiment_logs_schema()
 		except sqlite3.Error as e:
 			raise RuntimeError(f"Failed to initialize database schema: {e}")
 
@@ -203,6 +204,28 @@ class ExperimentDB:
 		)
 		self._execute("DROP TABLE llvm_instruction_counts_legacy")
 
+	def _ensure_experiment_logs_schema(self) -> None:
+		self._execute(
+			"""
+			CREATE TABLE IF NOT EXISTS experiment_logs (
+				log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+				exp_id INTEGER NOT NULL,
+				stage TEXT NOT NULL,
+				level TEXT NOT NULL,
+				message TEXT NOT NULL,
+				payload_json TEXT,
+				created_at TEXT NOT NULL,
+				FOREIGN KEY(exp_id) REFERENCES experiments(exp_id)
+			)
+			"""
+		)
+		self._execute(
+			"CREATE INDEX IF NOT EXISTS idx_experiment_logs_exp_id ON experiment_logs(exp_id)"
+		)
+		self._execute(
+			"CREATE INDEX IF NOT EXISTS idx_experiment_logs_stage ON experiment_logs(stage)"
+		)
+
 	def add_experiment(
 		self,
 		kernel_type: str,
@@ -295,6 +318,66 @@ class ExperimentDB:
 			return cursor.rowcount > 0
 		except sqlite3.Error as e:
 			raise RuntimeError(f"Failed to record experiment diagnostic: {e}")
+
+	def add_experiment_log(
+		self,
+		exp_id: int,
+		stage: str,
+		level: str,
+		message: str,
+		payload: Optional[Dict[str, Any]] = None,
+	) -> Optional[int]:
+		try:
+			cursor = self._execute(
+				"""
+				INSERT INTO experiment_logs
+				(exp_id, stage, level, message, payload_json, created_at)
+				VALUES (?, ?, ?, ?, ?, ?)
+				""",
+				(
+					exp_id,
+					stage,
+					level,
+					message,
+					json.dumps(payload, sort_keys=True) if payload is not None else None,
+					datetime.now().isoformat(),
+				),
+			)
+			return int(cursor.lastrowid) if cursor.lastrowid is not None else None
+		except (sqlite3.Error, TypeError, ValueError) as e:
+			raise RuntimeError(f"Failed to add experiment log: {e}")
+
+	def get_experiment_logs(self, exp_id: int) -> List[Dict[str, Any]]:
+		try:
+			cursor = self._execute(
+				"""
+				SELECT log_id, exp_id, stage, level, message, payload_json, created_at
+				FROM experiment_logs
+				WHERE exp_id = ?
+				ORDER BY log_id ASC
+				""",
+				(exp_id,),
+			)
+			rows = cursor.fetchall()
+			logs: List[Dict[str, Any]] = []
+			for row in rows:
+				payload = None
+				if row[5]:
+					payload = json.loads(row[5])
+				logs.append(
+					{
+						"log_id": row[0],
+						"exp_id": row[1],
+						"stage": row[2],
+						"level": row[3],
+						"message": row[4],
+						"payload": payload,
+						"created_at": row[6],
+					}
+				)
+			return logs
+		except (sqlite3.Error, json.JSONDecodeError) as e:
+			raise RuntimeError(f"Failed to query experiment logs: {e}")
 
 	def get_pending_experiments(self, limit: Optional[int] = None) -> List[ExperimentResult]:
 		try:

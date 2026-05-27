@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import random
 from pathlib import Path
 from statistics import mean, median
@@ -16,7 +17,10 @@ from ..core.parameter_distance import (
 from ..core.parameter_space import build_parameter_index_specs
 
 
-DEFAULT_DB = "experiments/exp_20260415_large_scale_5000cfg/experiments.db"
+DEFAULT_DB = os.environ.get(
+	"TWO_STEP_AUTOTUNING_DB",
+	"experiments/exp_20260415_large_scale_5000cfg/experiments.db",
+)
 
 
 def _parse_case(value: str) -> tuple[str, str]:
