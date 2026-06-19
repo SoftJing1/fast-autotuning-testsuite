@@ -251,16 +251,16 @@ KERNEL_QUALIFIER void gaussian_1(
             // copy lcl -> prv
             #if IN_CACHE_PRV == 1
             {
-                for (size_t prv_1 = 0; prv_1 < PRV_1 + 4; ++prv_1)
-                for (size_t prv_2 = 0; prv_2 < PRV_2 + 4; ++prv_2)
-                    IN_PRV(prv_1,
-                           prv_2) =
+                for (size_t cache_prv_1 = 0; cache_prv_1 < PRV_1 + 4; ++cache_prv_1)
+                for (size_t cache_prv_2 = 0; cache_prv_2 < PRV_2 + 4; ++cache_prv_2)
+                    IN_PRV(cache_prv_1,
+                           cache_prv_2) =
                     #if IN_CACHE_LCL == 1
-                    IN_LCL(lcl_1,  wi_1,  prv_1,
-                           lcl_2,  wi_2,  prv_2)
+                    IN_LCL(lcl_1,  wi_1,  cache_prv_1,
+                           lcl_2,  wi_2,  cache_prv_2)
                     #else
-                    IN_GLB(glb_1,  wg_1,  lcl_1,  wi_1,  prv_1,
-                           glb_2,  wg_2,  lcl_2,  wi_2,  prv_2)
+                    IN_GLB(glb_1,  wg_1,  lcl_1,  wi_1,  cache_prv_1,
+                           glb_2,  wg_2,  lcl_2,  wi_2,  cache_prv_2)
                     #endif
                         ;
             }
