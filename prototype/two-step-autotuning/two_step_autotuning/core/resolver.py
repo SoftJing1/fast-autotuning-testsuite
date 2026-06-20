@@ -7,25 +7,17 @@ from typing import Any
 import numpy as np
 
 from .dataset import TuningDataset
-from .instruction_map import log1p
 from .instruction_space import EXCLUDED_INSTRUCTION_OPCODES, filter_instruction_opcodes
 from .types import KernelRecord, LiveProfile, ResolutionResult
 
 
-@dataclass(frozen=True)
-class ResolverWeights:
-	raw: float = 1.0
-	normalized: float = 0.0
-	total: float = 0.0
+INSTRUCTION_DISTANCE_METRICS = ("euclidean", "normalized-euclidean")
 
 
 @dataclass(frozen=True)
 class _DistanceResult:
 	index: int | None
 	distance: float | None = None
-	raw_distance: float | None = None
-	mix_distance: float | None = None
-	total_distance: float | None = None
 	duplicate_count: int = 0
 	resolver_time_ms: float = 0.0
 
@@ -35,11 +27,21 @@ class _DistanceResult:
 
 
 class _InstructionDistanceIndex:
-	def __init__(self, items: list[Any], opcodes: list[str], weights: ResolverWeights):
-		self.weights = weights
+	def __init__(
+		self,
+		items: list[Any],
+		opcodes: list[str],
+		metric: str = "euclidean",
+		normalization_scales: dict[str, float] | None = None,
+	):
+		if metric not in INSTRUCTION_DISTANCE_METRICS:
+			raise ValueError(f"Unknown instruction distance metric: {metric}")
 		self.items: list[Any] = []
 		self.opcodes = opcodes
+		self.metric = metric
+		self.normalization_scales = normalization_scales
 		self._count_matrix: np.ndarray | None = None
+		self._scale_vector: np.ndarray | None = None
 		self.rebuild(items, opcodes)
 
 	def rebuild(self, items: list[Any], opcodes: list[str]) -> None:
@@ -47,23 +49,42 @@ class _InstructionDistanceIndex:
 		self.opcodes = list(opcodes)
 		if not self.items:
 			self._count_matrix = None
+			self._scale_vector = None
 			return
 		self._count_matrix = np.array(
 			[[max(float(item.raw_counts.get(op, 0)), 0.0) for op in self.opcodes] for item in self.items],
 			dtype=float,
 		)
+		self._scale_vector = self._build_scale_vector()
+
+	def _build_scale_vector(self) -> np.ndarray:
+		if self.metric != "normalized-euclidean":
+			return np.ones(len(self.opcodes), dtype=float)
+		if self.normalization_scales is not None:
+			scales = np.array(
+				[max(float(self.normalization_scales.get(op, 1.0)), 1.0) for op in self.opcodes],
+				dtype=float,
+			)
+		elif self._count_matrix is not None and len(self.items) > 1:
+			scales = self._count_matrix.std(axis=0)
+		else:
+			scales = np.ones(len(self.opcodes), dtype=float)
+		scales = scales.astype(float)
+		scales[~np.isfinite(scales)] = 1.0
+		scales[scales <= 0.0] = 1.0
+		return scales
 
 	def nearest(self, requested_counts: dict[str, Any], max_distance: float | None = None) -> _DistanceResult:
 		start = time.perf_counter()
-		if not self.items or self._count_matrix is None:
+		if not self.items or self._count_matrix is None or self._scale_vector is None:
 			return _DistanceResult(index=None, resolver_time_ms=0.0)
 
 		request_vector = np.array(
 			[max(float(requested_counts.get(op, 0)), 0.0) for op in self.opcodes],
 			dtype=float,
 		)
-		raw_dist = np.sqrt(((self._count_matrix - request_vector) ** 2).sum(axis=1))
-		combined = raw_dist
+		diff = (self._count_matrix - request_vector) / self._scale_vector
+		combined = np.sqrt((diff ** 2).sum(axis=1))
 		best_index = int(np.argmin(combined))
 		best_distance = float(combined[best_index])
 		if max_distance is not None and best_distance > max_distance:
@@ -73,16 +94,13 @@ class _InstructionDistanceIndex:
 		return _DistanceResult(
 			index=best,
 			distance=best_distance,
-			raw_distance=float(raw_dist[best_index]),
-			mix_distance=0.0,
-			total_distance=0.0,
 			duplicate_count=int(np.isclose(combined, best_distance, rtol=0.0, atol=1.0e-12).sum()),
 			resolver_time_ms=(time.perf_counter() - start) * 1000.0,
 		)
 
 	def distance_to_counts(self, requested_counts: dict[str, Any], candidate_counts: dict[str, Any]) -> _DistanceResult:
 		start = time.perf_counter()
-		if self._count_matrix is None or not self.opcodes:
+		if self._count_matrix is None or self._scale_vector is None or not self.opcodes:
 			return _DistanceResult(index=None, resolver_time_ms=0.0)
 
 		request_vector = np.array(
@@ -93,13 +111,10 @@ class _InstructionDistanceIndex:
 			[max(float(candidate_counts.get(op, 0)), 0.0) for op in self.opcodes],
 			dtype=float,
 		)
-		raw_distance = float(np.sqrt(((candidate_vector - request_vector) ** 2).sum()))
+		distance = float(np.sqrt((((candidate_vector - request_vector) / self._scale_vector) ** 2).sum()))
 		return _DistanceResult(
 			index=0,
-			distance=raw_distance,
-			raw_distance=raw_distance,
-			mix_distance=0.0,
-			total_distance=0.0,
+			distance=distance,
 			duplicate_count=1,
 			resolver_time_ms=(time.perf_counter() - start) * 1000.0,
 		)
@@ -111,20 +126,29 @@ class DatabaseApproxInstructionMapResolver:
 	def __init__(
 		self,
 		dataset: TuningDataset,
-		weights: ResolverWeights | None = None,
 		max_distance: float | None = None,
+		metric: str = "euclidean",
 		excluded_opcodes: set[str] | frozenset[str] | None = None,
 	):
 		self.dataset = dataset
-		self.weights = weights or ResolverWeights()
 		self.max_distance = max_distance
+		self.metric = metric
 		self.excluded_opcodes = (
 			EXCLUDED_INSTRUCTION_OPCODES if excluded_opcodes is None else frozenset(excluded_opcodes)
 		)
 		self.opcodes = filter_instruction_opcodes(dataset.opcodes)
 		self._records = dataset.records
-		self._distance_index = _InstructionDistanceIndex(self._records, self.opcodes, self.weights)
+		self._distance_index = _InstructionDistanceIndex(self._records, self.opcodes, metric=metric)
 		self._records_by_instruction_key = self._group_by_instruction_key()
+
+	@property
+	def normalization_scales(self) -> dict[str, float]:
+		if self._distance_index._scale_vector is None:
+			return {}
+		return {
+			op: float(scale)
+			for op, scale in zip(self.opcodes, self._distance_index._scale_vector, strict=True)
+		}
 
 	def _instruction_key(self, counts: dict[str, Any]) -> str:
 		return "|".join(f"{op}={int(counts.get(op, 0))}" for op in self.opcodes)
@@ -142,9 +166,6 @@ class DatabaseApproxInstructionMapResolver:
 				status="invalid",
 				record=None,
 				distance=match.distance,
-				raw_distance=match.raw_distance,
-				mix_distance=match.mix_distance,
-				total_distance=match.total_distance,
 				resolver_time_ms=match.resolver_time_ms,
 			)
 
@@ -156,9 +177,6 @@ class DatabaseApproxInstructionMapResolver:
 			status=status,
 			record=nearest_record,
 			distance=match.distance,
-			raw_distance=match.raw_distance,
-			mix_distance=match.mix_distance,
-			total_distance=match.total_distance,
 			duplicate_count=len(candidates),
 			resolver_time_ms=match.resolver_time_ms,
 		)
@@ -169,9 +187,6 @@ class LiveResolutionResult:
 	status: str
 	profile: LiveProfile | None
 	distance: float | None = None
-	raw_distance: float | None = None
-	mix_distance: float | None = None
-	total_distance: float | None = None
 	duplicate_count: int = 0
 	resolver_time_ms: float = 0.0
 
@@ -183,14 +198,21 @@ class LiveResolutionResult:
 class OnlineInstructionMapResolver:
 	def __init__(
 		self,
-		weights: ResolverWeights | None = None,
 		max_distance: float | None = None,
+		metric: str = "euclidean",
+		normalization_scales: dict[str, float] | None = None,
 	):
-		self.weights = weights or ResolverWeights()
 		self.max_distance = max_distance
+		self.metric = metric
+		self.normalization_scales = normalization_scales
 		self.profiles: list[LiveProfile] = []
 		self.opcodes: list[str] = []
-		self._distance_index = _InstructionDistanceIndex([], [], self.weights)
+		self._distance_index = _InstructionDistanceIndex(
+			[],
+			[],
+			metric=metric,
+			normalization_scales=normalization_scales,
+		)
 
 	def add_profiles(self, profiles: list[LiveProfile]) -> None:
 		existing = {profile.param_hash for profile in self.profiles}
@@ -210,9 +232,6 @@ class OnlineInstructionMapResolver:
 				"invalid",
 				None,
 				distance=match.distance,
-				raw_distance=match.raw_distance,
-				mix_distance=match.mix_distance,
-				total_distance=match.total_distance,
 				duplicate_count=match.duplicate_count,
 				resolver_time_ms=match.resolver_time_ms,
 			)
@@ -221,9 +240,6 @@ class OnlineInstructionMapResolver:
 			"ambiguous" if match.duplicate_count > 1 else "valid",
 			self.profiles[match.index],
 			distance=match.distance,
-			raw_distance=match.raw_distance,
-			mix_distance=match.mix_distance,
-			total_distance=match.total_distance,
 			duplicate_count=match.duplicate_count,
 			resolver_time_ms=match.resolver_time_ms,
 		)
@@ -237,9 +253,6 @@ class OnlineInstructionMapResolver:
 			status,
 			profile,
 			distance=match.distance,
-			raw_distance=match.raw_distance,
-			mix_distance=match.mix_distance,
-			total_distance=match.total_distance,
 			duplicate_count=match.duplicate_count,
 			resolver_time_ms=match.resolver_time_ms,
 		)

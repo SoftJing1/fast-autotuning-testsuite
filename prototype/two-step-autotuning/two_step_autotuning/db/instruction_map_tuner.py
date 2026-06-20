@@ -14,7 +14,7 @@ from ..core.instruction_space import (
 	counts_from_tuning_indices,
 	indices_from_counts,
 )
-from ..core.resolver import DatabaseApproxInstructionMapResolver, ResolverWeights
+from ..core.resolver import DatabaseApproxInstructionMapResolver, INSTRUCTION_DISTANCE_METRICS
 from ..core.result_recorder import ResultRecorder
 
 
@@ -34,12 +34,8 @@ class InstructionMapTuningInterface(MeasurementInterface):
 		self._manipulator = build_instruction_manipulator(self.parameter_specs)
 		self.resolver = DatabaseApproxInstructionMapResolver(
 			self.dataset,
-			weights=ResolverWeights(
-				raw=args.raw_weight,
-				normalized=args.normalized_weight,
-				total=args.total_weight,
-			),
 			max_distance=args.max_resolver_distance,
+			metric=args.resolver_distance_metric,
 		)
 		self.recorder = ResultRecorder(
 			args.output_dir,
@@ -55,14 +51,11 @@ class InstructionMapTuningInterface(MeasurementInterface):
 				"valid_config_limit": args.valid_config_limit,
 				"opcodes": sorted(self.parameter_specs),
 				"encoding": "observed_value_index",
-				"distance_metric": "euclidean_instruction_count_vector",
+				"distance_metric": args.resolver_distance_metric,
 				"instruction_value_counts": {
 					op: len(spec.values)
 					for op, spec in sorted(self.parameter_specs.items())
 				},
-				"raw_weight": args.raw_weight,
-				"normalized_weight": args.normalized_weight,
-				"total_weight": args.total_weight,
 				"max_resolver_distance": args.max_resolver_distance,
 			},
 		)
@@ -86,9 +79,6 @@ class InstructionMapTuningInterface(MeasurementInterface):
 					"candidate_status": result.status,
 					"runtime_ms": self.args.invalid_runtime_ms,
 					"resolver_distance": result.distance,
-					"raw_distance": result.raw_distance,
-					"mix_distance": result.mix_distance,
-					"total_distance": result.total_distance,
 					"resolver_time_ms": result.resolver_time_ms,
 					"duplicate_count": result.duplicate_count,
 				}
@@ -102,9 +92,6 @@ class InstructionMapTuningInterface(MeasurementInterface):
 				"exp_id": record.exp_id,
 				"param_hash": record.param_hash,
 				"resolver_distance": result.distance,
-				"raw_distance": result.raw_distance,
-				"mix_distance": result.mix_distance,
-				"total_distance": result.total_distance,
 				"resolver_time_ms": result.resolver_time_ms,
 				"duplicate_count": result.duplicate_count,
 			}
@@ -127,9 +114,6 @@ class InstructionMapTuningInterface(MeasurementInterface):
 			"resolver_result": {
 				"status": result.status,
 				"distance": result.distance,
-				"raw_distance": result.raw_distance,
-				"mix_distance": result.mix_distance,
-				"total_distance": result.total_distance,
 				"duplicate_count": result.duplicate_count,
 			},
 			"resolved_config": None if result.record is None else result.record.config,
@@ -154,10 +138,13 @@ def build_argparser():
 	parser.add_argument("--top-config-count", type=int, default=32)
 	parser.add_argument("--min-log-range", type=int, default=1024)
 	parser.add_argument("--min-log-ratio", type=float, default=16.0)
-	parser.add_argument("--raw-weight", type=float, default=0.4)
-	parser.add_argument("--normalized-weight", type=float, default=0.5)
-	parser.add_argument("--total-weight", type=float, default=0.1)
 	parser.add_argument("--max-resolver-distance", type=float, default=None)
+	parser.add_argument(
+		"--resolver-distance-metric",
+		choices=INSTRUCTION_DISTANCE_METRICS,
+		default="euclidean",
+		help="Distance metric used by the instruction-map resolver.",
+	)
 	return parser
 
 

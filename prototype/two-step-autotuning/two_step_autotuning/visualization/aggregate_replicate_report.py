@@ -15,9 +15,13 @@ CASES = (
 	("gaussian_512", "Gaussian 512x512"),
 	("gaussian_1024", "Gaussian 1024x1024"),
 	("gaussian_2048", "Gaussian 2048x2048"),
-	("gemm_128", "GEMM 128x128x128"),
-	("gemm_256", "GEMM 256x256x256"),
-	("gemm_512", "GEMM 512x512x512"),
+	("gaussian_512x1024", "Gaussian 512x1024"),
+	("gaussian_1024x512", "Gaussian 1024x512"),
+	("gaussian_1024x2048", "Gaussian 1024x2048"),
+	("gaussian_2048x1024", "Gaussian 2048x1024"),
+	("gaussian_4096", "Gaussian 4096x4096"),
+	("gaussian_2048x4096", "Gaussian 2048x4096"),
+	("gaussian_4096x2048", "Gaussian 4096x2048"),
 )
 
 METHODS = (
@@ -40,11 +44,11 @@ def _quantile(sorted_values: list[float], q: float) -> float:
 	return sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
 
 
-def _load_unique_valid_series(trace_path: Path) -> dict[int, float]:
+def _load_valid_evaluation_series(trace_path: Path) -> dict[int, float]:
 	series: dict[int, float] = {}
 	with trace_path.open() as f:
 		for row in csv.DictReader(f):
-			x_value = row.get("unique_config_count", "")
+			x_value = row.get("valid_evaluation_count", "")
 			y_value = row.get("best_runtime_ms", "")
 			if not x_value or not y_value:
 				continue
@@ -86,7 +90,7 @@ def _aggregate_method(case_dir: Path, method_dir_name: str) -> dict:
 	for method_dir in seed_dirs:
 		trace_path = method_dir / "trace.csv"
 		summary_path = method_dir / "summary.json"
-		series = _load_unique_valid_series(trace_path)
+		series = _load_valid_evaluation_series(trace_path)
 		if series:
 			seed_series.append(series)
 		if summary_path.exists():
@@ -163,7 +167,7 @@ def plot_case_aggregate(case_dir: Path, output_path: Path, title: str) -> dict[s
 			linewidth=0,
 		)
 
-	ax.set_xlabel("Unique valid configuration")
+	ax.set_xlabel("Valid evaluation")
 	ax.set_ylabel("Best runtime so far (ms)")
 	ax.set_yscale("log")
 	ax.grid(True, alpha=0.3)
@@ -188,7 +192,7 @@ def build_report(run_root: Path, output: Path) -> None:
 
 	for case_dir_name, title in CASES:
 		case_dir = run_root / case_dir_name
-		plot_path = case_dir / "aggregate_convergence_unique_valid.png"
+		plot_path = case_dir / "aggregate_convergence_valid_eval.png"
 		aggregates = plot_case_aggregate(case_dir, plot_path, title)
 		report_data[case_dir_name] = aggregates
 		plot_rel = plot_path.relative_to(output.parent)
@@ -198,12 +202,12 @@ def build_report(run_root: Path, output: Path) -> None:
 			seed_dir = case_dir / f"seed_{seed}"
 			if not seed_dir.exists():
 				continue
-			seed_plot_path = seed_dir / "convergence_unique_valid.png"
+			seed_plot_path = seed_dir / "convergence_valid_eval.png"
 			plot_run(
 				seed_dir,
 				seed_plot_path,
 				title=f"{title} - Seed {seed}",
-				x_axis="unique_valid",
+				x_axis="valid",
 			)
 			seed_plot_rel = seed_plot_path.relative_to(output.parent)
 			seed_figure_blocks.append(
@@ -288,7 +292,7 @@ def build_report(run_root: Path, output: Path) -> None:
 <body>
 	<header>
 		<h1>Two-Step Autotuning Aggregate Report</h1>
-		<p>Aggregate over all recorded seeds per case. X-axis is unique valid configurations. Y-axis is best runtime so far, log scale.</p>
+		<p>Aggregate over all recorded seeds per case. X-axis is valid evaluations. Y-axis is best runtime so far, log scale.</p>
 	</header>
 	<main>
 		{''.join(sections)}

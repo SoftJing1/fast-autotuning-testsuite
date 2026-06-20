@@ -14,26 +14,51 @@ from ..core.instruction_space import (
 	counts_from_tuning_indices,
 	nearest_indices_from_counts,
 )
-from ..core.resolver import DatabaseApproxInstructionMapResolver, LiveResolutionResult, ResolverWeights
+from ..core.resolver import (
+	DatabaseApproxInstructionMapResolver,
+	INSTRUCTION_DISTANCE_METRICS,
+	LiveResolutionResult,
+)
 from ..core.result_recorder import ResultRecorder
 from ..core.types import LiveProfile
 from .config_space import LiveConfigGenerator, hash_config
 from .executor import LiveKernelExecutor, check_instruction_counter_available
-from .mutation import LocalInstructionMapMutator
+from .inner_parameter_tuner import (
+	InnerParameterTunerResult,
+	instruction_map_distance,
+	target_distance_for_ratio,
+	target_hit,
+	tune_inner_parameter_config,
+)
+
+
+def resolver_mode_for_refinement_mode(refinement_mode: str) -> str:
+	return "database_plus_inner_tuner" if refinement_mode == "inner-tuner" else "database_only"
+
+
+def resolver_distance_ratio(
+	db_distance: float | None,
+	refined_distance: float | None,
+) -> float | None:
+	if db_distance is None or refined_distance is None:
+		return None
+	if db_distance == 0.0:
+		return 1.0 if refined_distance == 0.0 else None
+	return refined_distance / db_distance
 
 
 class _DatabaseBackedLiveResolver:
 	def __init__(
 		self,
 		dataset: TuningDataset,
-		weights: ResolverWeights,
 		max_distance: float | None = None,
+		distance_metric: str = "euclidean",
 	):
 		self.dataset = dataset
 		self.resolver = DatabaseApproxInstructionMapResolver(
 			dataset,
-			weights=weights,
 			max_distance=max_distance,
+			metric=distance_metric,
 		)
 
 	def resolve(self, requested_counts: dict[str, int]):
@@ -43,9 +68,6 @@ class _DatabaseBackedLiveResolver:
 				status=result.status,
 				profile=None,
 				distance=result.distance,
-				raw_distance=result.raw_distance,
-				mix_distance=result.mix_distance,
-				total_distance=result.total_distance,
 				duplicate_count=result.duplicate_count,
 				resolver_time_ms=result.resolver_time_ms,
 			)
@@ -61,9 +83,6 @@ class _DatabaseBackedLiveResolver:
 				raw_counts=record.raw_counts,
 			),
 			distance=result.distance,
-			raw_distance=result.raw_distance,
-			mix_distance=result.mix_distance,
-			total_distance=result.total_distance,
 			duplicate_count=result.duplicate_count,
 			resolver_time_ms=result.resolver_time_ms,
 		)
@@ -92,6 +111,7 @@ class LiveTwoStepTuningInterface(MeasurementInterface):
 			Path(args.resolver_db),
 			args.kernel,
 			args.input_size,
+			require_runtime=False,
 		)
 		self.parameter_specs = build_instruction_parameter_specs(
 			self.resolver_dataset,
@@ -107,37 +127,29 @@ class LiveTwoStepTuningInterface(MeasurementInterface):
 		self._manipulator = build_instruction_manipulator(self.parameter_specs)
 		self.resolver = _DatabaseBackedLiveResolver(
 			dataset=self.resolver_dataset,
-			weights=ResolverWeights(
-				raw=args.raw_weight,
-				normalized=args.normalized_weight,
-				total=args.total_weight,
-			),
 			max_distance=args.max_resolver_distance,
-		)
-		self.mutator = LocalInstructionMapMutator(
-			self.config_generator,
-			self.executor,
-			mutation_budget=args.resolver_mutation_budget,
+			distance_metric=args.resolver_distance_metric,
 		)
 		metadata = live_metadata(args, "live_two_step_tuning")
 		metadata.update(
 			{
 				"instruction_space_source": "resolver_dataset_full",
 				"shared_start_param_hash": hash_config(self.start_config),
-				"resolver_mode": "database_only",
+				"resolver_mode": resolver_mode_for_refinement_mode(args.resolver_refinement_mode),
 				"max_values_per_op": args.max_values_per_op,
 				"opcodes": sorted(self.parameter_specs),
-				"distance_metric": "euclidean_instruction_count_vector",
+				"distance_metric": args.resolver_distance_metric,
 				"instruction_value_counts": {
 					op: len(spec.values)
 					for op, spec in sorted(self.parameter_specs.items())
 				},
-				"raw_weight": args.raw_weight,
-				"normalized_weight": args.normalized_weight,
-				"total_weight": args.total_weight,
 				"max_resolver_distance": args.max_resolver_distance,
 				"resolver_db_record_count": len(self.resolver_dataset.records),
-				"resolver_mutation_budget": args.resolver_mutation_budget,
+				"resolver_refinement_mode": args.resolver_refinement_mode,
+				"resolver_inner_valid_profile_limit": args.resolver_inner_valid_profile_limit,
+				"resolver_inner_test_limit": args.resolver_inner_test_limit,
+				"resolver_inner_target_ratio": args.resolver_inner_target_ratio,
+				"resolver_inner_invalid_distance_penalty": args.resolver_inner_invalid_distance_penalty,
 			}
 		)
 		self.recorder = ResultRecorder(args.output_dir, metadata)
@@ -163,16 +175,27 @@ class LiveTwoStepTuningInterface(MeasurementInterface):
 					"candidate_status": resolution.status,
 					"runtime_ms": self.args.invalid_runtime_ms,
 					"resolver_distance": resolution.distance,
-					"raw_distance": resolution.raw_distance,
-					"mix_distance": resolution.mix_distance,
-					"total_distance": resolution.total_distance,
+					"db_resolver_distance": resolution.distance,
+					"refined_resolver_distance": "",
+					"distance_ratio": "",
+					"resolver_source": "database",
+					"db_param_hash": "",
+					"resolved_param_hash": "",
+					"resolver_profile_count": 0,
 					"resolver_time_ms": resolution.resolver_time_ms,
+					"resolver_refinement_time_ms": 0.0,
 					"duplicate_count": resolution.duplicate_count,
+					"inner_valid_profile_count": 0,
+					"inner_total_tests": 0,
+					"inner_invalid_count": 0,
+					"inner_target_distance": "",
+					"inner_target_hit": "",
+					"inner_wall_time_ms": 0.0,
 				}
 			)
 			return Result(time=self.args.invalid_runtime_ms)
 
-		refined = self.mutator.refine(requested_counts, resolution.profile)
+		refined = self._refine_resolution(requested_counts, resolution.profile, resolution.distance)
 		execution = self.executor.execute_config(refined.profile.config)
 		if not execution.valid or execution.profile is None or execution.runtime_ms is None:
 			self.recorder.record(
@@ -180,11 +203,22 @@ class LiveTwoStepTuningInterface(MeasurementInterface):
 					"candidate_status": "execution_failed",
 					"runtime_ms": self.args.invalid_runtime_ms,
 					"resolver_distance": refined.distance,
-					"raw_distance": refined.distance,
-					"mix_distance": resolution.mix_distance,
-					"total_distance": resolution.total_distance,
+					"db_resolver_distance": resolution.distance,
+					"refined_resolver_distance": refined.distance,
+					"distance_ratio": refined.distance_ratio,
+					"resolver_source": refined.source,
+					"db_param_hash": resolution.profile.param_hash,
+					"resolved_param_hash": refined.profile.param_hash,
+					"resolver_profile_count": refined.valid_profile_count,
 					"resolver_time_ms": resolution.resolver_time_ms,
+					"resolver_refinement_time_ms": refined.wall_time_ms,
 					"duplicate_count": resolution.duplicate_count,
+					"inner_valid_profile_count": refined.valid_profile_count,
+					"inner_total_tests": refined.total_tests,
+					"inner_invalid_count": refined.invalid_count,
+					"inner_target_distance": "" if refined.target_distance is None else refined.target_distance,
+					"inner_target_hit": refined.target_hit,
+					"inner_wall_time_ms": refined.wall_time_ms,
 				}
 			)
 			return Result(time=self.args.invalid_runtime_ms)
@@ -192,23 +226,34 @@ class LiveTwoStepTuningInterface(MeasurementInterface):
 		profile = execution.profile
 		self.recorder.record(
 			{
-				"candidate_status": resolution.status if refined.source == "database" else "mutated_" + resolution.status,
+				"candidate_status": resolution.status if refined.source == "database" else "inner_tuned_" + resolution.status,
 				"runtime_ms": execution.runtime_ms,
 				"exp_id": profile.exp_id,
 				"param_hash": profile.param_hash,
 				"resolver_distance": refined.distance,
-				"raw_distance": refined.distance,
-				"mix_distance": resolution.mix_distance,
-				"total_distance": resolution.total_distance,
+				"db_resolver_distance": resolution.distance,
+				"refined_resolver_distance": refined.distance,
+				"distance_ratio": refined.distance_ratio,
+				"resolver_source": refined.source,
+				"db_param_hash": resolution.profile.param_hash,
+				"resolved_param_hash": refined.profile.param_hash,
+				"resolver_profile_count": refined.valid_profile_count,
 				"resolver_time_ms": resolution.resolver_time_ms,
+				"resolver_refinement_time_ms": refined.wall_time_ms,
 				"duplicate_count": resolution.duplicate_count,
+				"inner_valid_profile_count": refined.valid_profile_count,
+				"inner_total_tests": refined.total_tests,
+				"inner_invalid_count": refined.invalid_count,
+				"inner_target_distance": "" if refined.target_distance is None else refined.target_distance,
+				"inner_target_hit": refined.target_hit,
+				"inner_wall_time_ms": refined.wall_time_ms,
 			}
 		)
 		return Result(time=execution.runtime_ms)
 
 	def extra_convergence_criteria(self, result):
-		limit = self.args.valid_config_limit
-		return limit is not None and len(self.recorder.seen_exp_ids) >= limit
+		limit = self.args.valid_evaluation_limit
+		return limit is not None and self.recorder.valid_evaluation_count >= limit
 
 	def save_final_config(self, config):
 		requested_counts = dict(self.default_counts)
@@ -216,7 +261,7 @@ class LiveTwoStepTuningInterface(MeasurementInterface):
 		resolution = self.resolver.resolve(requested_counts)
 		refined = None
 		if resolution.valid and resolution.profile is not None:
-			refined = self.mutator.refine(requested_counts, resolution.profile)
+			refined = self._refine_resolution(requested_counts, resolution.profile, resolution.distance)
 		payload = {
 			"encoding": "online_instruction_value_index",
 			"index_config": dict(config.data),
@@ -224,10 +269,21 @@ class LiveTwoStepTuningInterface(MeasurementInterface):
 			"resolver_result": {
 				"status": resolution.status,
 				"distance": resolution.distance,
-				"raw_distance": resolution.raw_distance,
-				"mix_distance": resolution.mix_distance,
-				"total_distance": resolution.total_distance,
 				"duplicate_count": resolution.duplicate_count,
+			},
+			"refined_resolver_result": None
+			if refined is None
+			else {
+				"source": refined.source,
+				"distance": refined.distance,
+				"distance_ratio": refined.distance_ratio,
+				"profile_count": refined.valid_profile_count,
+				"total_tests": refined.total_tests,
+				"invalid_count": refined.invalid_count,
+				"target_distance": refined.target_distance,
+				"target_hit": refined.target_hit,
+				"wall_time_ms": refined.wall_time_ms,
+				"chosen_param_hash": refined.profile.param_hash,
 			},
 			"resolved_config": None
 			if refined is None
@@ -238,12 +294,18 @@ class LiveTwoStepTuningInterface(MeasurementInterface):
 				"exp_id": resolution.profile.exp_id,
 				"param_hash": resolution.profile.param_hash,
 			},
-			"mutation_result": None
+			"inner_tuner_result": None
 			if refined is None
 			else {
 				"source": refined.source,
 				"distance": refined.distance,
-				"profile_count": len(refined.mutated_profiles),
+				"distance_ratio": refined.distance_ratio,
+				"valid_profile_count": refined.valid_profile_count,
+				"total_tests": refined.total_tests,
+				"invalid_count": refined.invalid_count,
+				"target_distance": refined.target_distance,
+				"target_hit": refined.target_hit,
+				"wall_time_ms": refined.wall_time_ms,
 				"chosen_param_hash": refined.profile.param_hash,
 			},
 		}
@@ -270,24 +332,82 @@ class LiveTwoStepTuningInterface(MeasurementInterface):
 				"exp_id": profile.exp_id,
 				"param_hash": profile.param_hash,
 				"resolver_distance": 0.0,
-				"raw_distance": 0.0,
-				"mix_distance": 0.0,
-				"total_distance": 0.0,
+				"db_resolver_distance": 0.0,
+				"refined_resolver_distance": 0.0,
+				"distance_ratio": 1.0,
+				"resolver_source": "shared_start",
+				"db_param_hash": profile.param_hash,
+				"resolved_param_hash": profile.param_hash,
+				"resolver_profile_count": 0,
 				"resolver_time_ms": 0.0,
+				"resolver_refinement_time_ms": 0.0,
 				"duplicate_count": 1,
+				"inner_valid_profile_count": 0,
+				"inner_total_tests": 0,
+				"inner_invalid_count": 0,
+				"inner_target_distance": "",
+				"inner_target_hit": "",
+				"inner_wall_time_ms": 0.0,
 			}
 		)
 		return Result(time=execution.runtime_ms)
+
+	def _refine_resolution(self, requested_counts, db_profile, db_distance):
+		normalization_scales = (
+			self.resolver.resolver.normalization_scales
+			if self.args.resolver_distance_metric == "normalized-euclidean"
+			else None
+		)
+		if self.args.resolver_refinement_mode == "database":
+			distance = (
+				float(db_distance)
+				if db_distance is not None
+				else instruction_map_distance(requested_counts, db_profile.raw_counts, normalization_scales)
+			)
+			target_distance = target_distance_for_ratio(db_distance, self.args.resolver_inner_target_ratio)
+			return InnerParameterTunerResult(
+				profile=db_profile,
+				distance=distance,
+				source="database",
+				db_distance=db_distance,
+				distance_ratio=resolver_distance_ratio(db_distance, distance),
+				target_distance=target_distance,
+				target_hit=target_hit(distance, target_distance),
+				valid_profile_count=0,
+				total_tests=0,
+				invalid_count=0,
+				wall_time_ms=0.0,
+			)
+		return tune_inner_parameter_config(
+			self.args,
+			self.config_generator,
+			self.executor,
+			requested_counts,
+			db_profile,
+			db_distance,
+			normalization_scales=normalization_scales,
+		)
 
 def build_argparser():
 	parser = opentuner.default_argparser()
 	add_live_arguments(parser)
 	parser.add_argument("--max-values-per-op", type=int, default=12)
-	parser.add_argument("--raw-weight", type=float, default=0.4)
-	parser.add_argument("--normalized-weight", type=float, default=0.5)
-	parser.add_argument("--total-weight", type=float, default=0.1)
 	parser.add_argument("--max-resolver-distance", type=float, default=None)
-	parser.add_argument("--resolver-mutation-budget", type=int, default=64)
+	parser.add_argument(
+		"--resolver-distance-metric",
+		choices=INSTRUCTION_DISTANCE_METRICS,
+		default="euclidean",
+		help="Distance metric used by the instruction-map resolver.",
+	)
+	parser.add_argument(
+		"--resolver-refinement-mode",
+		choices=("database", "inner-tuner"),
+		default="inner-tuner",
+	)
+	parser.add_argument("--resolver-inner-valid-profile-limit", type=int, default=32)
+	parser.add_argument("--resolver-inner-test-limit", type=int, default=512)
+	parser.add_argument("--resolver-inner-target-ratio", type=float, default=0.1)
+	parser.add_argument("--resolver-inner-invalid-distance-penalty", type=float, default=1.0e12)
 	return parser
 
 

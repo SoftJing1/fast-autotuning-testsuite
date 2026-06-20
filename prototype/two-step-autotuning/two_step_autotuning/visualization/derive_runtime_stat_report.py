@@ -89,13 +89,10 @@ def _rewrite_method_dir(src_dir: Path, dst_dir: Path, statistic: str) -> None:
 						"candidate_status",
 						"duplicate_count",
 						"exp_id",
-						"mix_distance",
 						"param_hash",
-						"raw_distance",
 						"resolver_distance",
 						"resolver_time_ms",
 						"runtime_ms",
-						"total_distance",
 					)
 					if key in out and out[key] != ""
 				}

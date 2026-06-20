@@ -11,9 +11,13 @@ CASES = (
 	("gaussian_512", "Gaussian 512x512"),
 	("gaussian_1024", "Gaussian 1024x1024"),
 	("gaussian_2048", "Gaussian 2048x2048"),
-	("gemm_128", "GEMM 128x128x128"),
-	("gemm_256", "GEMM 256x256x256"),
-	("gemm_512", "GEMM 512x512x512"),
+	("gaussian_512x1024", "Gaussian 512x1024"),
+	("gaussian_1024x512", "Gaussian 1024x512"),
+	("gaussian_1024x2048", "Gaussian 1024x2048"),
+	("gaussian_2048x1024", "Gaussian 2048x1024"),
+	("gaussian_4096", "Gaussian 4096x4096"),
+	("gaussian_2048x4096", "Gaussian 2048x4096"),
+	("gaussian_4096x2048", "Gaussian 4096x2048"),
 )
 
 

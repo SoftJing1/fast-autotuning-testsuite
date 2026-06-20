@@ -64,6 +64,7 @@ DEFAULT_BUILD_DIR = "build"
 DEFAULT_RUNS_PER_CONFIG = 3
 DEFAULT_PERSIST_ARTIFACTS = False
 MAX_ERROR_MESSAGE_LEN = 4000
+COLLECTION_MODES = ("runtime-and-instruction", "instruction-map-only")
 
 KERNEL_TEMPLATE_SPECS = {
 	"gemm": [
@@ -137,7 +138,7 @@ class KernelAverageResult:
 @dataclass(frozen=True)
 class SchedulingResult:
 	"""Experiment work items plus count of configs that could not be scheduled."""
-	experiments: List[Tuple[int, str, str, str, str, str, int, bool]]
+	experiments: List[Tuple[int, str, str, str, str, str, int, bool, str]]
 	error_count: int
 
 
@@ -293,6 +294,51 @@ def run_kernel_average(
 		errors=tuple(errors),
 		run_results=tuple(run_results),
 	)
+
+
+def dump_opencl_binary_only(
+	kernel_type: str,
+	config_file: str,
+	build_dir: str,
+	dump_opencl_binary: str,
+) -> KernelRunResult:
+	"""Ask the host executable to compile and dump the runtime OpenCL binary without timing."""
+	try:
+		exe_path = os.path.join(build_dir, kernel_type)
+		if not os.path.exists(exe_path):
+			return KernelRunResult(
+				runtime_ms=None,
+				error_msg=f"Executable not found: {exe_path}",
+			)
+		if not os.path.exists(config_file):
+			return KernelRunResult(
+				runtime_ms=None,
+				error_msg=f"Config file not found: {config_file}",
+			)
+
+		Path(dump_opencl_binary).parent.mkdir(parents=True, exist_ok=True)
+		cmd = [exe_path, config_file, "--dump-opencl-binary-only", dump_opencl_binary]
+		result = subprocess.run(cmd, capture_output=True, text=True)
+		if result.returncode != 0:
+			return KernelRunResult(
+				runtime_ms=None,
+				error_msg=_truncate_error(
+					f"Binary dump command failed with exit code {result.returncode}: {' '.join(cmd)}"
+				),
+				returncode=result.returncode,
+				stdout_tail=_tail_text(result.stdout),
+				stderr_tail=_tail_text(result.stderr),
+			)
+		return KernelRunResult(
+			runtime_ms=0.0,
+			returncode=result.returncode,
+			stdout_tail=_tail_text(result.stdout),
+			stderr_tail=_tail_text(result.stderr),
+		)
+	except OSError as exc:
+		return KernelRunResult(runtime_ms=None, error_msg=f"Binary dump failed: {exc}")
+	except Exception as exc:
+		return KernelRunResult(runtime_ms=None, error_msg=f"Unexpected binary dump error: {exc}")
 
 
 def _kernel_size_string(kernel_type: str, config_dict: Dict) -> str:
@@ -604,7 +650,8 @@ def _schedule_single_experiment(
 	runs_per_config: int,
 	resume: bool,
 	persist_artifacts: bool,
-) -> Optional[Tuple[int, str, str, str, str, str, int, bool]]:
+	collection_mode: str,
+) -> Optional[Tuple[int, str, str, str, str, str, int, bool, str]]:
 	with open(config_file) as f:
 		config = json.load(f)
 
@@ -636,6 +683,7 @@ def _schedule_single_experiment(
 		build_dir,
 		runs_per_config,
 		persist_artifacts,
+		collection_mode,
 	)
 
 
@@ -647,9 +695,10 @@ def schedule_experiment_work(
 	runs_per_config: int,
 	resume: bool,
 	persist_artifacts: bool,
+	collection_mode: str,
 ) -> SchedulingResult:
 	"""Create DB rows and worker arguments for configs that are ready to run."""
-	experiments: List[Tuple[int, str, str, str, str, str, int, bool]] = []
+	experiments: List[Tuple[int, str, str, str, str, str, int, bool, str]] = []
 	error_count = 0
 
 	with ExperimentDB(str(db_path)) as db:
@@ -665,6 +714,7 @@ def schedule_experiment_work(
 					runs_per_config=runs_per_config,
 					resume=resume,
 					persist_artifacts=persist_artifacts,
+					collection_mode=collection_mode,
 				)
 			except Exception as exc:
 				error_count += 1
@@ -938,7 +988,7 @@ def _record_worker_diagnostics(
 		print(f"Warning: exp_id={exp_id}: {warning}", file=sys.stderr)
 
 
-def process_single_experiment(args: Tuple[int, str, str, str, str, str, int, bool]) -> Tuple[int, bool, str]:
+def process_single_experiment(args: Tuple[int, str, str, str, str, str, int, bool, str]) -> Tuple[int, bool, str]:
 	"""Process single experiment in worker process."""
 	(
 		exp_id,
@@ -949,6 +999,7 @@ def process_single_experiment(args: Tuple[int, str, str, str, str, str, int, boo
 		build_dir,
 		runs_per_config,
 		persist_artifacts,
+		collection_mode,
 	) = args
 
 	artifact_tempdir: Optional[tempfile.TemporaryDirectory[str]] = None
@@ -965,6 +1016,92 @@ def process_single_experiment(args: Tuple[int, str, str, str, str, str, int, boo
 				artifact_tempdir = tempfile.TemporaryDirectory(prefix="collect_artifacts_")
 				artifact_root = Path(artifact_tempdir.name)
 			opencl_binary_path = artifact_root / f"{kernel_type}_{size_str}_{param_hash}.opencl.bin"
+
+			if collection_mode == "instruction-map-only":
+				dump_result = dump_opencl_binary_only(
+					kernel_type,
+					config_file,
+					build_dir=build_dir,
+					dump_opencl_binary=str(opencl_binary_path),
+				)
+				if not dump_result.success:
+					details = dump_result.error_msg or "OpenCL binary dump failed"
+					if dump_result.stderr_tail:
+						details = f"{details}; stderr: {dump_result.stderr_tail}"
+					elif dump_result.stdout_tail:
+						details = f"{details}; stdout: {dump_result.stdout_tail}"
+					return _worker_failure(
+						db,
+						exp_id,
+						details,
+						stage="binary_dump",
+						payload={
+							"kernel_type": kernel_type,
+							"config_file": config_file,
+							"build_dir": build_dir,
+							"persist_artifacts": persist_artifacts,
+						},
+					)
+
+				ir_result = _extract_runtime_ir_result(
+					kernel_type,
+					config,
+					param_hash,
+					artifact_root,
+					opencl_binary_path,
+					persist_artifacts=persist_artifacts,
+				)
+				if not ir_result.success:
+					return _worker_failure(
+						db,
+						exp_id,
+						ir_result.error_msg or "Runtime LLVM IR extraction failed",
+						stage="runtime_ir",
+						payload={"persist_artifacts": persist_artifacts},
+					)
+
+				llvm_paths = [artifact["llvm_ir_path"] for artifact in ir_result.artifacts]
+				symbolic_errors = _store_symbolic_instruction_counts(db, exp_id, ir_result.artifacts)
+				if symbolic_errors:
+					return _worker_failure(
+						db,
+						exp_id,
+						"instruction-count extraction failed: " + " | ".join(symbolic_errors),
+						stage="symbolic_counts",
+						payload={
+							"artifact_count": len(ir_result.artifacts),
+							"errors": list(symbolic_errors),
+							"persist_artifacts": persist_artifacts,
+						},
+					)
+				db.mark_profiled(
+					exp_id,
+					_serialize_llvm_paths([artifact["llvm_ir_ref"] for artifact in ir_result.artifacts])
+					if persist_artifacts else None,
+				)
+				_record_db_log(
+					db,
+					exp_id,
+					"collector",
+					"info",
+					"Collected symbolic instruction counts without runtime measurement.",
+					payload={
+						"artifact_count": len(ir_result.artifacts),
+						"persist_artifacts": persist_artifacts,
+						"templates": [artifact["template_name"] for artifact in ir_result.artifacts],
+					},
+				)
+				if not persist_artifacts:
+					for path in llvm_paths:
+						try:
+							Path(path).unlink(missing_ok=True)
+						except OSError:
+							pass
+					try:
+						opencl_binary_path.unlink(missing_ok=True)
+					except OSError:
+						pass
+				return (exp_id, True, "")
 
 			runtime_result = run_kernel_average(
 				kernel_type,
@@ -1146,8 +1283,11 @@ def collect_experiments(
 	build_dir: str,
 	runs_per_config: int,
 	persist_artifacts: bool,
+	collection_mode: str = "runtime-and-instruction",
 ) -> int:
 	"""Main collection pipeline from request tuples."""
+	if collection_mode not in COLLECTION_MODES:
+		raise ValueError(f"collection_mode must be one of {COLLECTION_MODES}")
 	if num_workers is None:
 		num_workers = max(1, cpu_count() - 1)
 	if num_workers <= 0:
@@ -1173,6 +1313,7 @@ def collect_experiments(
 	print(f"Artifact store: {llvm_root if persist_artifacts else 'transient worker tempdirs only'}")
 	print(f"Build dir:      {build_dir}")
 	print(f"Runs/config:    {runs_per_config}")
+	print(f"Mode:           {collection_mode}")
 	print(f"Workers:        {num_workers}")
 	print(f"Resume:         {resume}")
 	print(f"Persist files:  {persist_artifacts}")
@@ -1188,6 +1329,7 @@ def collect_experiments(
 		"build_dir": build_dir,
 		"runs_per_config": runs_per_config,
 		"persist_artifacts": persist_artifacts,
+		"collection_mode": collection_mode,
 		"requests": [
 			{
 				"kernel_type": req.kernel_type,
@@ -1216,6 +1358,7 @@ def collect_experiments(
 			runs_per_config=runs_per_config,
 			resume=resume,
 			persist_artifacts=persist_artifacts,
+			collection_mode=collection_mode,
 		)
 		experiments = scheduling.experiments
 
@@ -1249,6 +1392,7 @@ def collect_experiments(
 		print("Final Statistics:")
 		print(f"  Total:       {stats['total']:,}")
 		print(f"  Completed:   {stats['completed']:,}")
+		print(f"  Profiled:    {stats.get('profiled', 0):,}")
 		print(f"  Failed:      {stats['failed']:,}")
 		print(f"  Pending:     {stats['pending']:,}")
 		if stats["avg_runtime_ms"]:
@@ -1366,6 +1510,12 @@ def main() -> int:
 		action="store_true",
 		help="Keep dumped OpenCL binaries and runtime LLVM IR files under the experiment directory.",
 	)
+	parser.add_argument(
+		"--collection-mode",
+		choices=COLLECTION_MODES,
+		default="runtime-and-instruction",
+		help="Collect full runtime plus instruction counts, or instruction maps only.",
+	)
 
 	args = parser.parse_args()
 
@@ -1400,6 +1550,7 @@ def main() -> int:
 		build_dir=args.build_dir,
 		runs_per_config=args.runs_per_config,
 		persist_artifacts=args.persist_artifacts,
+		collection_mode=args.collection_mode,
 	)
 
 

@@ -14,6 +14,8 @@ from ..core.instruction_space import filter_instruction_opcodes
 def _load_series(trace_path: Path, x_axis: str) -> tuple[list[int], list[float]]:
 	iterations: list[int] = []
 	best_values: list[float] = []
+	if not trace_path.exists():
+		return iterations, best_values
 	with trace_path.open() as f:
 		for row in csv.DictReader(f):
 			value = row.get("best_runtime_ms", "")
@@ -112,7 +114,7 @@ def plot_run(
 	run_dir: Path,
 	output_path: Path,
 	title: str | None = None,
-	x_axis: str = "iteration",
+	x_axis: str = "valid",
 	common_x_limit: bool = False,
 	x_limit: int | None = None,
 ) -> None:
@@ -164,7 +166,7 @@ def plot_run(
 
 	xlabel = {
 		"iteration": "OpenTuner attempt",
-		"valid": "Valid dataset evaluation",
+		"valid": "Valid evaluation",
 		"unique_valid": "Unique valid dataset configuration",
 	}[x_axis]
 	ax.set_xlabel(xlabel)
@@ -218,7 +220,7 @@ def main() -> int:
 	parser.add_argument(
 		"--x-axis",
 		choices=["iteration", "valid", "unique_valid"],
-		default="iteration",
+		default="valid",
 		help="Use all OpenTuner attempts, valid evaluations, or unique valid configs as the x-axis.",
 	)
 	parser.add_argument(

@@ -89,8 +89,13 @@ def _build_gaussian_generator_specs(
 	max_wg_size: int,
 ) -> dict[str, ParameterIndexSpec]:
 	h, w = dims
-	dim1 = module.get_valid_dim1_factors(h, max_wi_size, max_wg_size)
-	wi1_values = sorted(set(dim1["WI_1"]))
+	dim1_values = {
+		"glb_1": set(),
+		"wg_1": set(),
+		"lcl_1": set(),
+		"wi_1": set(),
+		"prv_1": set(),
+	}
 	dim2_values = {
 		"glb_2": set(),
 		"wg_2": set(),
@@ -98,29 +103,33 @@ def _build_gaussian_generator_specs(
 		"wi_2": set(),
 		"prv_2": set(),
 	}
-	for wi1 in wi1_values:
-		dim2 = module.get_valid_dim2_factors(w, wi1, max_wi_size, max_wg_size)
-		for key, values in dim2.items():
-			dim2_values[key.lower()].update(values)
+	for wi_1_ocl_dim, wi_2_ocl_dim in module.OCL_DIM_PAIRS:
+		dim1 = module.get_valid_dim1_factors(h, max_wi_size, max_wg_size, wi_1_ocl_dim)
+		for key, values in dim1.items():
+			dim1_values[key.lower()].update(values)
+		for wi1 in sorted(set(dim1["WI_1"])):
+			dim2 = module.get_valid_dim2_factors(w, wi1, max_wi_size, max_wg_size, wi_2_ocl_dim)
+			for key, values in dim2.items():
+				dim2_values[key.lower()].update(values)
 	return {
-		"g_cb_res_dest_level": ParameterIndexSpec("g_cb_res_dest_level", (2,)),
-		"l_cb_res_dest_level": ParameterIndexSpec("l_cb_res_dest_level", (0,)),
-		"p_cb_res_dest_level": ParameterIndexSpec("p_cb_res_dest_level", (0,)),
+		"g_cb_res_dest_level": ParameterIndexSpec("g_cb_res_dest_level", (0, 1, 2)),
+		"l_cb_res_dest_level": ParameterIndexSpec("l_cb_res_dest_level", (0, 1, 2)),
+		"p_cb_res_dest_level": ParameterIndexSpec("p_cb_res_dest_level", (0, 1, 2)),
 		"images_cache_lcl": ParameterIndexSpec("images_cache_lcl", (0, 1)),
 		"images_cache_prv": ParameterIndexSpec("images_cache_prv", (0, 1)),
 		"filter_cache_lcl": ParameterIndexSpec("filter_cache_lcl", (0, 1)),
 		"filter_cache_prv": ParameterIndexSpec("filter_cache_prv", (0, 1)),
 		"out_cache_prv": ParameterIndexSpec("out_cache_prv", (0, 1)),
-		"wg_1_ocl_dim": ParameterIndexSpec("wg_1_ocl_dim", (1,)),
-		"wg_2_ocl_dim": ParameterIndexSpec("wg_2_ocl_dim", (0,)),
-		"wi_1_ocl_dim": ParameterIndexSpec("wi_1_ocl_dim", (1,)),
-		"wi_2_ocl_dim": ParameterIndexSpec("wi_2_ocl_dim", (0,)),
+		"wg_1_ocl_dim": ParameterIndexSpec("wg_1_ocl_dim", (0, 1)),
+		"wg_2_ocl_dim": ParameterIndexSpec("wg_2_ocl_dim", (0, 1)),
+		"wi_1_ocl_dim": ParameterIndexSpec("wi_1_ocl_dim", (0, 1)),
+		"wi_2_ocl_dim": ParameterIndexSpec("wi_2_ocl_dim", (0, 1)),
 		"input_size_1": ParameterIndexSpec("input_size_1", (h,)),
-		"glb_1": ParameterIndexSpec("glb_1", tuple(sorted(set(dim1["GLB_1"])))),
-		"wg_1": ParameterIndexSpec("wg_1", tuple(sorted(set(dim1["WG_1"])))),
-		"lcl_1": ParameterIndexSpec("lcl_1", tuple(sorted(set(dim1["LCL_1"])))),
-		"wi_1": ParameterIndexSpec("wi_1", tuple(wi1_values)),
-		"prv_1": ParameterIndexSpec("prv_1", tuple(sorted(set(dim1["PRV_1"])))),
+		"glb_1": ParameterIndexSpec("glb_1", tuple(sorted(dim1_values["glb_1"]))),
+		"wg_1": ParameterIndexSpec("wg_1", tuple(sorted(dim1_values["wg_1"]))),
+		"lcl_1": ParameterIndexSpec("lcl_1", tuple(sorted(dim1_values["lcl_1"]))),
+		"wi_1": ParameterIndexSpec("wi_1", tuple(sorted(dim1_values["wi_1"]))),
+		"prv_1": ParameterIndexSpec("prv_1", tuple(sorted(dim1_values["prv_1"]))),
 		"input_size_2": ParameterIndexSpec("input_size_2", (w,)),
 		"glb_2": ParameterIndexSpec("glb_2", tuple(sorted(dim2_values["glb_2"]))),
 		"wg_2": ParameterIndexSpec("wg_2", tuple(sorted(dim2_values["wg_2"]))),
