@@ -99,8 +99,8 @@ class LiveParameterTuningInterface(MeasurementInterface):
 		return Result(time=result.runtime_ms)
 
 	def extra_convergence_criteria(self, result):
-		limit = self.args.valid_config_limit
-		return limit is not None and len(self.recorder.seen_exp_ids) >= limit
+		limit = self.args.valid_evaluation_limit
+		return limit is not None and self.recorder.valid_evaluation_count >= limit
 
 	def save_final_config(self, config):
 		index_config = dict(config.data)

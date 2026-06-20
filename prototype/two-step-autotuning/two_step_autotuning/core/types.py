@@ -11,7 +11,7 @@ class KernelRecord:
 	input_size: str
 	param_hash: str
 	config: dict[str, Any]
-	runtime_ms: float
+	runtime_ms: float | None
 	raw_counts: dict[str, int]
 
 	@property
@@ -27,9 +27,6 @@ class LiveProfile:
 	param_hash: str
 	config: dict[str, Any]
 	raw_counts: dict[str, int]
-	runtime_ms: float | None = None
-	warmup_runtimes_ms: tuple[float, ...] = ()
-	measured_runtimes_ms: tuple[float, ...] = ()
 
 	@property
 	def total_count(self) -> int:
@@ -41,9 +38,6 @@ class ResolutionResult:
 	status: str
 	record: KernelRecord | None
 	distance: float | None = None
-	raw_distance: float | None = None
-	mix_distance: float | None = None
-	total_distance: float | None = None
 	duplicate_count: int = 0
 	resolver_time_ms: float = 0.0
 

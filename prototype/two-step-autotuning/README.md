@@ -15,8 +15,10 @@ The live tuners are the real application prototype.
   generated tuning-parameter configs and each valid config is executed directly.
 - `two_step_autotuning.live.two_step_tuner` is the proposed method. OpenTuner
   searches an instruction-map encoding. A resolver maps each requested
-  instruction map to the closest known live-profiled config, then that config is
-  executed and recorded.
+  instruction map to the closest known live-profiled config, then an inner
+  parameter tuner starts from that exact DB match and profiles nearby generated
+  parameter configs against the requested instruction map. The final resolved
+  config is executed and recorded.
 
 Both live tuners write `trace.csv`, `summary.json`, `final_config.json`,
 OpenTuner's database, generated config JSON files, dumped OpenCL binaries,
@@ -30,7 +32,7 @@ PYTHONPATH=prototype/two-step-autotuning python3 -m two_step_autotuning.live.par
   --input-size 512x512 \
   --output-dir prototype/two-step-autotuning/runs/live_parameter_gaussian_512 \
   --database sqlite:///prototype/two-step-autotuning/runs/live_parameter_gaussian_512/opentuner.db \
-  --valid-config-limit 200 \
+  --valid-evaluation-limit 200 \
   --test-limit 20000
 ```
 
@@ -42,15 +44,29 @@ PYTHONPATH=prototype/two-step-autotuning python3 -m two_step_autotuning.live.two
   --input-size 512x512 \
   --output-dir prototype/two-step-autotuning/runs/live_two_step_gaussian_512 \
   --database sqlite:///prototype/two-step-autotuning/runs/live_two_step_gaussian_512/opentuner.db \
-  --bootstrap-profile-count 64 \
-  --resolver-candidate-limit 64 \
-  --valid-config-limit 200 \
+  --resolver-refinement-mode inner-tuner \
+  --resolver-inner-valid-profile-limit 32 \
+  --resolver-inner-test-limit 512 \
+  --resolver-inner-target-ratio 0.1 \
+  --valid-evaluation-limit 200 \
   --test-limit 20000
 ```
 
-`--resolver-candidate-limit` is the inner resolver autotuning iteration limit
-per requested instruction map. It no longer means "pre-profile this many fresh
-resolver candidates and choose the nearest one".
+Use `--resolver-refinement-mode database` to execute only the DB-resolved config.
+The default `inner-tuner` mode profiles parameter configs until it reaches the
+valid-profile budget, total-test budget, or target distance ratio.
+
+Inner tuner diagnostic smoke run:
+
+```bash
+PYTHONPATH=prototype/two-step-autotuning python3 -m two_step_autotuning.live.diagnose_inner_parameter_tuner \
+  --kernel gaussian \
+  --input-size 512x512 \
+  --output-dir prototype/two-step-autotuning/runs/diagnose_inner_gaussian_512 \
+  --request-count 1 \
+  --resolver-inner-valid-profile-limit 2 \
+  --resolver-inner-test-limit 16
+```
 
 The two-step tuner requires `symb-viewer` and its shared-library dependencies to
 be available, because it extracts static instruction counts from dumped runtime
@@ -74,7 +90,9 @@ Live-only files are kept to the application boundary:
 - `live/executor.py`: compile/profile/run and run-local database storage.
 - `live/parameter_tuner.py`: live baseline tuner entrypoint.
 - `live/two_step_tuner.py`: live two-step tuner entrypoint.
+- `live/inner_parameter_tuner.py`: nested parameter-space resolver refinement.
 - `live/diagnose_two_step.py`: concrete single-resolution diagnostic.
+- `live/diagnose_inner_parameter_tuner.py`: DB-vs-inner-tuner distance diagnostic.
 
 ## Database Replay Tuners
 

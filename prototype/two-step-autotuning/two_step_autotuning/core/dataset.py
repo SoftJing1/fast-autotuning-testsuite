@@ -19,24 +19,39 @@ INPUT_KEYS_BY_KERNEL = {
 
 
 class TuningDataset:
-	def __init__(self, db_path: str | Path, kernel_type: str, input_size: str):
+	def __init__(
+		self,
+		db_path: str | Path,
+		kernel_type: str,
+		input_size: str,
+		require_runtime: bool = True,
+	):
 		self.db_path = Path(db_path)
 		self.kernel_type = kernel_type
 		self.input_size = input_size
+		self.require_runtime = require_runtime
 		self.records = self._load_records()
 		if not self.records:
+			status_label = "completed" if self.require_runtime else "completed/profiled"
 			raise ValueError(
-				f"No completed records with instruction counts for {kernel_type}/{input_size} in {self.db_path}"
+				f"No {status_label} records with instruction counts for {kernel_type}/{input_size} in {self.db_path}"
 			)
 		self.opcodes = sorted({op for record in self.records for op in record.raw_counts})
 		self.config_by_key = {canonical_config_key(record.config): record for record in self.records}
 		self.records_by_instruction_key = self._group_by_instruction_key()
-		self.best_record = min(self.records, key=lambda record: record.runtime_ms)
+		runtime_records = [record for record in self.records if record.runtime_ms is not None]
+		self.best_record = (
+			min(runtime_records, key=lambda record: float(record.runtime_ms))
+			if runtime_records
+			else self.records[0]
+		)
 
 	def _load_records(self) -> list[KernelRecord]:
 		conn = sqlite3.connect(str(self.db_path))
 		conn.row_factory = sqlite3.Row
 		try:
+			runtime_filter = "AND e.runtime_ms IS NOT NULL" if self.require_runtime else ""
+			status_filter = "e.status = 'completed'" if self.require_runtime else "e.status IN ('completed', 'profiled')"
 			rows = conn.execute(
 				"""
 				SELECT
@@ -50,12 +65,12 @@ class TuningDataset:
 					lic.total_instruction_counts_json
 				FROM experiments e
 				JOIN llvm_instruction_counts lic ON lic.exp_id = e.exp_id
-				WHERE e.status = 'completed'
-				  AND e.runtime_ms IS NOT NULL
+				WHERE {status_filter}
+				  {runtime_filter}
 				  AND e.kernel_type = ?
 				  AND e.input_size = ?
 				ORDER BY e.exp_id ASC, lic.template_name ASC
-				""",
+				""".format(status_filter=status_filter, runtime_filter=runtime_filter),
 				(self.kernel_type, self.input_size),
 			).fetchall()
 		finally:
@@ -73,7 +88,7 @@ class TuningDataset:
 					"input_size": row["input_size"],
 					"param_hash": row["param_hash"],
 					"config": json.loads(row["config_json"]),
-					"runtime_ms": float(row["runtime_ms"]),
+					"runtime_ms": None if row["runtime_ms"] is None else float(row["runtime_ms"]),
 				},
 			)
 			counts_by_exp[exp_id].append(json.loads(row["total_instruction_counts_json"]))
@@ -129,7 +144,14 @@ class TuningDataset:
 		return {name: sorted(items) for name, items in values.items()}
 
 	def top_records(self, count: int) -> list[KernelRecord]:
-		return sorted(self.records, key=lambda record: record.runtime_ms)[:count]
+		return sorted(
+			self.records,
+			key=lambda record: (
+				record.runtime_ms is None,
+				float("inf") if record.runtime_ms is None else float(record.runtime_ms),
+				record.exp_id,
+			),
+		)[:count]
 
 	def sampled_records(self, count: int, seed: int) -> list[KernelRecord]:
 		if count <= 0:

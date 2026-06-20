@@ -6,17 +6,11 @@ from typing import Any
 import numpy as np
 
 from .dataset import TuningDataset
-from .resolver import ResolverWeights
-
-
 @dataclass(frozen=True)
 class InstructionNeighborResult:
 	base_exp_id: int
 	neighbor_exp_id: int
 	distance: float
-	raw_distance: float
-	mix_distance: float
-	total_distance: float
 	runtime_ms: float
 	neighbor_runtime_ms: float
 	abs_runtime_diff_ms: float
@@ -28,9 +22,8 @@ class InstructionNeighborResult:
 class InstructionDistanceModel:
 	"""Vectorized Euclidean distance model over instruction-count vectors."""
 
-	def __init__(self, dataset: TuningDataset, weights: ResolverWeights | None = None):
+	def __init__(self, dataset: TuningDataset):
 		self.dataset = dataset
-		self.weights = weights or ResolverWeights()
 		self.opcodes = dataset.opcodes
 		self.records = dataset.records
 		self.exp_ids = np.array([record.exp_id for record in self.records], dtype=int)
@@ -46,21 +39,15 @@ class InstructionDistanceModel:
 	def component_distances_to_counts(
 		self,
 		counts: dict[str, Any],
-	) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+	) -> np.ndarray:
 		request_vector = np.array(
 			[max(float(counts.get(op, 0)), 0.0) for op in self.opcodes],
 			dtype=float,
 		)
-		raw_dist = np.sqrt(((self.count_matrix - request_vector) ** 2).sum(axis=1))
-		mix_dist = np.zeros_like(raw_dist)
-		total_dist = np.zeros_like(raw_dist)
-		combined = raw_dist
-		return combined, raw_dist, mix_dist, total_dist
+		return np.sqrt(((self.count_matrix - request_vector) ** 2).sum(axis=1))
 
 	def nearest_neighbor(self, base_index: int) -> InstructionNeighborResult:
-		combined, raw_dist, mix_dist, total_dist = self.component_distances_to_counts(
-			self.records[base_index].raw_counts
-		)
+		combined = self.component_distances_to_counts(self.records[base_index].raw_counts)
 		combined = combined.astype(float)
 		combined[base_index] = np.inf
 		neighbor_index = int(np.argmin(combined))
@@ -74,9 +61,6 @@ class InstructionDistanceModel:
 			base_exp_id=int(self.exp_ids[base_index]),
 			neighbor_exp_id=int(self.exp_ids[neighbor_index]),
 			distance=distance,
-			raw_distance=float(raw_dist[neighbor_index]),
-			mix_distance=float(mix_dist[neighbor_index]),
-			total_distance=float(total_dist[neighbor_index]),
 			runtime_ms=runtime,
 			neighbor_runtime_ms=neighbor_runtime,
 			abs_runtime_diff_ms=abs_diff,

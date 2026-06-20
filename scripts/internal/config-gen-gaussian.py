@@ -36,6 +36,18 @@ except ImportError:
 # PARAMETER DEFINITION
 # =============================================================================
 
+CACHE_LEVEL_VALUES = (0, 1, 2)
+OCL_DIM_PAIRS = ((1, 0), (0, 1))
+
+
+def iter_cache_level_triples() -> Iterator[Tuple[int, int, int]]:
+    """Yield cache hierarchy triples satisfying G >= L >= P."""
+    for g in CACHE_LEVEL_VALUES:
+        for l in CACHE_LEVEL_VALUES:
+            for p in CACHE_LEVEL_VALUES:
+                if g >= l >= p:
+                    yield g, l, p
+
 def get_parameters_definition(H: int, W: int) -> ConfigurationManipulator:
     """Define the OpenTuner parameter search space for Gaussian kernel tuning.
     
@@ -52,9 +64,9 @@ def get_parameters_definition(H: int, W: int) -> ConfigurationManipulator:
     manipulator = ConfigurationManipulator()
 
     # Cache level parameters - control where data is cached
-    manipulator.add_parameter(IntegerParameter('G_CB_RES_DEST_LEVEL', 2, 2))
-    manipulator.add_parameter(IntegerParameter('L_CB_RES_DEST_LEVEL', 0, 0))
-    manipulator.add_parameter(IntegerParameter('P_CB_RES_DEST_LEVEL', 0, 0))
+    manipulator.add_parameter(IntegerParameter('G_CB_RES_DEST_LEVEL', 0, 2))
+    manipulator.add_parameter(IntegerParameter('L_CB_RES_DEST_LEVEL', 0, 2))
+    manipulator.add_parameter(IntegerParameter('P_CB_RES_DEST_LEVEL', 0, 2))
 
     # Cache flags - enable/disable caching at different levels
     manipulator.add_parameter(IntegerParameter('IN_CACHE_LCL', 0, 1))
@@ -62,12 +74,12 @@ def get_parameters_definition(H: int, W: int) -> ConfigurationManipulator:
     manipulator.add_parameter(IntegerParameter('OUT_CACHE_PRV', 0, 1))
 
     # Work group dimensions
-    manipulator.add_parameter(IntegerParameter('WG_1_OCL_DIM', 1, 1))
-    manipulator.add_parameter(IntegerParameter('WG_2_OCL_DIM', 0, 0))
+    manipulator.add_parameter(IntegerParameter('WG_1_OCL_DIM', 0, 1))
+    manipulator.add_parameter(IntegerParameter('WG_2_OCL_DIM', 0, 1))
 
     # Work item dimensions
-    manipulator.add_parameter(IntegerParameter('WI_1_OCL_DIM', 1, 1))
-    manipulator.add_parameter(IntegerParameter('WI_2_OCL_DIM', 0, 0))
+    manipulator.add_parameter(IntegerParameter('WI_1_OCL_DIM', 0, 1))
+    manipulator.add_parameter(IntegerParameter('WI_2_OCL_DIM', 0, 1))
 
     # Dimension 1 parameters
     manipulator.add_parameter(IntegerParameter('INPUT_SIZE_1', H, H))
@@ -149,6 +161,10 @@ def is_configuration_valid(
     """
     cfg = config
 
+    # Cache hierarchy constraints
+    if not (cfg['G_CB_RES_DEST_LEVEL'] >= cfg['L_CB_RES_DEST_LEVEL'] >= cfg['P_CB_RES_DEST_LEVEL']):
+        return False
+
     # Work item size constraints
     if cfg['WI_1'] > max_wi_size[cfg['WI_1_OCL_DIM']]:
         return False
@@ -158,9 +174,9 @@ def is_configuration_valid(
         return False
 
     # Dimension constraints
-    if cfg['WG_1_OCL_DIM'] == cfg['WG_2_OCL_DIM']:
+    if {cfg['WG_1_OCL_DIM'], cfg['WG_2_OCL_DIM']} != {0, 1}:
         return False
-    if cfg['WI_1_OCL_DIM'] == cfg['WI_2_OCL_DIM']:
+    if {cfg['WI_1_OCL_DIM'], cfg['WI_2_OCL_DIM']} != {0, 1}:
         return False
 
     # Dimension 1 divisibility constraints
@@ -342,6 +358,7 @@ def get_valid_dim1_factors(
     INPUT_SIZE_1: int,
     max_wi_size: Tuple[int, int, int],
     max_wg_size: int,
+    wi_1_ocl_dim: int = 1,
 ) -> Dict[str, list]:
     """Generate all valid dimension-1 factor combinations respecting divisibility.
     
@@ -386,7 +403,7 @@ def get_valid_dim1_factors(
                 # WI_1 must respect hardware constraints
                 wi_1_options = [
                     i for i in range(1, rem3 + 1)
-                    if rem3 % i == 0 and i <= max_wi_size[1]
+                    if rem3 % i == 0 and i <= max_wi_size[wi_1_ocl_dim]
                 ]
                 
                 for wi_1 in wi_1_options:
@@ -410,6 +427,7 @@ def get_valid_dim2_factors(
     wi_1_value: int,
     max_wi_size: Tuple[int, int, int],
     max_wg_size: int,
+    wi_2_ocl_dim: int = 0,
 ) -> Dict[str, list]:
     """Generate all valid dimension-2 factors respecting cross-dim constraints.
     
@@ -446,7 +464,7 @@ def get_valid_dim2_factors(
             for lcl_2 in lcl_2_options:
                 rem3 = rem2 // lcl_2
                 # WI_2 must respect hardware constraints AND cross-dimension constraint
-                max_wi_2 = min(max_wi_size[2], max_wg_size // wi_1_value)
+                max_wi_2 = min(max_wi_size[wi_2_ocl_dim], max_wg_size // wi_1_value)
                 wi_2_options = [
                     i for i in range(1, rem3 + 1)
                     if rem3 % i == 0 and i <= max_wi_2
@@ -491,15 +509,8 @@ def exhaustive_iterate_configurations(
     Yields:
         Valid configuration dictionaries
     """
-    # Fixed parameters (based on example)
+    # Fixed input parameters.
     fixed_params = {
-        'G_CB_RES_DEST_LEVEL': 2,
-        'L_CB_RES_DEST_LEVEL': 0,
-        'P_CB_RES_DEST_LEVEL': 0,
-        'WG_1_OCL_DIM': 1,
-        'WG_2_OCL_DIM': 0,
-        'WI_1_OCL_DIM': 1,
-        'WI_2_OCL_DIM': 0,
         'INPUT_SIZE_1': H,
         'INPUT_SIZE_2': W,
     }
@@ -514,40 +525,58 @@ def exhaustive_iterate_configurations(
     cache_flag_names = list(cache_flags.keys())
     cache_flag_values = [cache_flags[name] for name in cache_flag_names]
 
-    # Pre-compute valid dimension 1 factors
-    valid_dim1 = get_valid_dim1_factors(H, max_wi_size, max_wg_size)
-
     # Iterate through all combinations with constraint enforcement
-    for cache_combo in product(*cache_flag_values):
-        cache_dict = dict(zip(cache_flag_names, cache_combo))
+    for cache_levels in iter_cache_level_triples():
+        cache_level_dict = {
+            'G_CB_RES_DEST_LEVEL': cache_levels[0],
+            'L_CB_RES_DEST_LEVEL': cache_levels[1],
+            'P_CB_RES_DEST_LEVEL': cache_levels[2],
+        }
+        for wg_dims in OCL_DIM_PAIRS:
+            wg_dim_dict = {'WG_1_OCL_DIM': wg_dims[0], 'WG_2_OCL_DIM': wg_dims[1]}
+            for wi_dims in OCL_DIM_PAIRS:
+                wi_dim_dict = {'WI_1_OCL_DIM': wi_dims[0], 'WI_2_OCL_DIM': wi_dims[1]}
+                valid_dim1 = get_valid_dim1_factors(H, max_wi_size, max_wg_size, wi_dims[0])
+                for cache_combo in product(*cache_flag_values):
+                    cache_dict = dict(zip(cache_flag_names, cache_combo))
 
-        # Build valid dim1 tuples: each index i has one valid tuple
-        for dim1_idx in range(len(valid_dim1['GLB_1'])):
-            dim1_dict = {
-                'GLB_1': valid_dim1['GLB_1'][dim1_idx],
-                'WG_1': valid_dim1['WG_1'][dim1_idx],
-                'LCL_1': valid_dim1['LCL_1'][dim1_idx],
-                'WI_1': valid_dim1['WI_1'][dim1_idx],
-                'PRV_1': valid_dim1['PRV_1'][dim1_idx],
-            }
+                    for dim1_idx in range(len(valid_dim1['GLB_1'])):
+                        dim1_dict = {
+                            'GLB_1': valid_dim1['GLB_1'][dim1_idx],
+                            'WG_1': valid_dim1['WG_1'][dim1_idx],
+                            'LCL_1': valid_dim1['LCL_1'][dim1_idx],
+                            'WI_1': valid_dim1['WI_1'][dim1_idx],
+                            'PRV_1': valid_dim1['PRV_1'][dim1_idx],
+                        }
 
-            # Compute valid dimension 2 factors given WI_1
-            valid_dim2 = get_valid_dim2_factors(W, dim1_dict['WI_1'], max_wi_size, max_wg_size)
+                        valid_dim2 = get_valid_dim2_factors(
+                            W,
+                            dim1_dict['WI_1'],
+                            max_wi_size,
+                            max_wg_size,
+                            wi_dims[1],
+                        )
 
-            # Build valid dim2 tuples
-            for dim2_idx in range(len(valid_dim2['GLB_2'])):
-                dim2_dict = {
-                    'GLB_2': valid_dim2['GLB_2'][dim2_idx],
-                    'WG_2': valid_dim2['WG_2'][dim2_idx],
-                    'LCL_2': valid_dim2['LCL_2'][dim2_idx],
-                    'WI_2': valid_dim2['WI_2'][dim2_idx],
-                    'PRV_2': valid_dim2['PRV_2'][dim2_idx],
-                }
+                        for dim2_idx in range(len(valid_dim2['GLB_2'])):
+                            dim2_dict = {
+                                'GLB_2': valid_dim2['GLB_2'][dim2_idx],
+                                'WG_2': valid_dim2['WG_2'][dim2_idx],
+                                'LCL_2': valid_dim2['LCL_2'][dim2_idx],
+                                'WI_2': valid_dim2['WI_2'][dim2_idx],
+                                'PRV_2': valid_dim2['PRV_2'][dim2_idx],
+                            }
 
-                # Combine all parameters—guaranteed valid
-                config = {**fixed_params, **cache_dict, **dim1_dict, **dim2_dict}
-                if is_configuration_valid(config, max_wi_size, max_wg_size):
-                    yield config
+                            config = {
+                                **fixed_params,
+                                **cache_level_dict,
+                                **wg_dim_dict,
+                                **wi_dim_dict,
+                                **cache_dict,
+                                **dim1_dict,
+                                **dim2_dict,
+                            }
+                            if is_configuration_valid(config, max_wi_size, max_wg_size):
+                                yield config
 
 
 
@@ -605,13 +634,6 @@ def random_sample_configurations(
         random.seed(seed)
 
     fixed_params = {
-        'G_CB_RES_DEST_LEVEL': 2,
-        'L_CB_RES_DEST_LEVEL': 0,
-        'P_CB_RES_DEST_LEVEL': 0,
-        'WG_1_OCL_DIM': 1,
-        'WG_2_OCL_DIM': 0,
-        'WI_1_OCL_DIM': 1,
-        'WI_2_OCL_DIM': 0,
         'INPUT_SIZE_1': H,
         'INPUT_SIZE_2': W,
     }
@@ -622,16 +644,9 @@ def random_sample_configurations(
         'OUT_CACHE_PRV': [0, 1],
     }
 
-    # Pre-compute valid dimension 1 and 2 factor chains
-    valid_dim1 = get_valid_dim1_factors(H, max_wi_size, max_wg_size)
-    num_dim1_options = len(valid_dim1['GLB_1'])
-
-    if num_dim1_options == 0:
-        print(f"Warning: No valid dimension 1 configurations for H={H}", file=sys.stderr)
-        return
-
     cache_flag_names = list(cache_flags.keys())
     cache_flag_values = [cache_flags[name] for name in cache_flag_names]
+    cache_level_triples = tuple(iter_cache_level_triples())
 
     seen = set()
     target = num_samples
@@ -644,6 +659,25 @@ def random_sample_configurations(
         # Random cache flags
         cache_combo = tuple(random.choice(v) for v in cache_flag_values)
         cache_dict = dict(zip(cache_flag_names, cache_combo))
+        cache_levels = random.choice(cache_level_triples)
+        cache_level_dict = {
+            'G_CB_RES_DEST_LEVEL': cache_levels[0],
+            'L_CB_RES_DEST_LEVEL': cache_levels[1],
+            'P_CB_RES_DEST_LEVEL': cache_levels[2],
+        }
+        wg_dims = random.choice(OCL_DIM_PAIRS)
+        wi_dims = random.choice(OCL_DIM_PAIRS)
+        dim_dict = {
+            'WG_1_OCL_DIM': wg_dims[0],
+            'WG_2_OCL_DIM': wg_dims[1],
+            'WI_1_OCL_DIM': wi_dims[0],
+            'WI_2_OCL_DIM': wi_dims[1],
+        }
+
+        valid_dim1 = get_valid_dim1_factors(H, max_wi_size, max_wg_size, wi_dims[0])
+        num_dim1_options = len(valid_dim1['GLB_1'])
+        if num_dim1_options == 0:
+            continue
 
         # Random dimension 1 choice from valid options
         dim1_idx = random.randint(0, num_dim1_options - 1)
@@ -656,7 +690,13 @@ def random_sample_configurations(
         }
 
         # Compute valid dimension 2 options given WI_1
-        valid_dim2 = get_valid_dim2_factors(W, dim1_dict['WI_1'], max_wi_size, max_wg_size)
+        valid_dim2 = get_valid_dim2_factors(
+            W,
+            dim1_dict['WI_1'],
+            max_wi_size,
+            max_wg_size,
+            wi_dims[1],
+        )
         num_dim2_options = len(valid_dim2['GLB_2'])
 
         if num_dim2_options == 0:
@@ -672,7 +712,9 @@ def random_sample_configurations(
             'PRV_2': valid_dim2['PRV_2'][dim2_idx],
         }
 
-        config = {**fixed_params, **cache_dict, **dim1_dict, **dim2_dict}
+        config = {**fixed_params, **cache_level_dict, **dim_dict, **cache_dict, **dim1_dict, **dim2_dict}
+        if not is_configuration_valid(config, max_wi_size, max_wg_size):
+            continue
 
         # Fast de-duplication check
         key = tuple(config.items())

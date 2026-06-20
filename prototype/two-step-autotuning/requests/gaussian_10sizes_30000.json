@@ -1,0 +1,12 @@
+[
+  {"kernel_type": "gaussian", "input_size": "512x512", "total_configs": 30000},
+  {"kernel_type": "gaussian", "input_size": "1024x1024", "total_configs": 30000},
+  {"kernel_type": "gaussian", "input_size": "2048x2048", "total_configs": 30000},
+  {"kernel_type": "gaussian", "input_size": "512x1024", "total_configs": 30000},
+  {"kernel_type": "gaussian", "input_size": "1024x512", "total_configs": 30000},
+  {"kernel_type": "gaussian", "input_size": "1024x2048", "total_configs": 30000},
+  {"kernel_type": "gaussian", "input_size": "2048x1024", "total_configs": 30000},
+  {"kernel_type": "gaussian", "input_size": "4096x4096", "total_configs": 30000},
+  {"kernel_type": "gaussian", "input_size": "2048x4096", "total_configs": 30000},
+  {"kernel_type": "gaussian", "input_size": "4096x2048", "total_configs": 30000}
+]

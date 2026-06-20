@@ -35,6 +35,13 @@ class LiveExecutionResult:
 		return self.profile is not None and self.status in {"profiled", "completed"}
 
 
+@dataclass(frozen=True)
+class CompletedExecution:
+	runtime_ms: float
+	warmup_runtimes_ms: tuple[float, ...] = ()
+	measured_runtimes_ms: tuple[float, ...] = ()
+
+
 def check_instruction_counter_available() -> None:
 	"""Fail early when the static instruction counter executable is unusable."""
 	if shutil.which("symb-viewer") is None:
@@ -85,7 +92,7 @@ class LiveKernelExecutor:
 		self.llvm_dir.mkdir(parents=True, exist_ok=True)
 		self.binary_dir.mkdir(parents=True, exist_ok=True)
 		self._profiles_by_key: dict[str, LiveProfile] = {}
-		self._runtime_by_key: dict[str, float] = {}
+		self._completed_by_key: dict[str, CompletedExecution] = {}
 
 	def profile_config(self, config: dict[str, Any]) -> LiveExecutionResult:
 		key = canonical_config_key(config)
@@ -94,9 +101,7 @@ class LiveKernelExecutor:
 			return LiveExecutionResult(
 				"profiled",
 				profile,
-				profile.runtime_ms,
-				warmup_runtimes_ms=profile.warmup_runtimes_ms,
-				measured_runtimes_ms=profile.measured_runtimes_ms,
+				None,
 			)
 
 		param_hash = hash_config(config)
@@ -149,14 +154,15 @@ class LiveKernelExecutor:
 
 	def execute_config(self, config: dict[str, Any]) -> LiveExecutionResult:
 		key = canonical_config_key(config)
-		if key in self._profiles_by_key and key in self._runtime_by_key:
+		if key in self._profiles_by_key and key in self._completed_by_key:
 			profile = self._profiles_by_key[key]
+			completed = self._completed_by_key[key]
 			return LiveExecutionResult(
 				"completed",
 				profile,
-				self._runtime_by_key[key],
-				warmup_runtimes_ms=profile.warmup_runtimes_ms,
-				measured_runtimes_ms=profile.measured_runtimes_ms,
+				completed.runtime_ms,
+				warmup_runtimes_ms=completed.warmup_runtimes_ms,
+				measured_runtimes_ms=completed.measured_runtimes_ms,
 			)
 
 		param_hash = hash_config(config)
@@ -224,18 +230,20 @@ class LiveKernelExecutor:
 			param_hash=param_hash,
 			config=dict(config),
 			raw_counts=raw_counts,
+		)
+		completed = CompletedExecution(
 			runtime_ms=runtime_result["runtime_ms"],
 			warmup_runtimes_ms=tuple(runtime_result["warmup_runtimes"]),
 			measured_runtimes_ms=tuple(runtime_result["measured_runtimes"]),
 		)
 		self._profiles_by_key[key] = profile
-		self._runtime_by_key[key] = runtime_result["runtime_ms"]
+		self._completed_by_key[key] = completed
 		return LiveExecutionResult(
 			"completed",
 			profile,
-			runtime_result["runtime_ms"],
-			warmup_runtimes_ms=tuple(runtime_result["warmup_runtimes"]),
-			measured_runtimes_ms=tuple(runtime_result["measured_runtimes"]),
+			completed.runtime_ms,
+			warmup_runtimes_ms=completed.warmup_runtimes_ms,
+			measured_runtimes_ms=completed.measured_runtimes_ms,
 		)
 
 	def _write_config(self, config: dict[str, Any], param_hash: str) -> Path:

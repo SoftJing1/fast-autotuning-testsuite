@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import sys
+from argparse import SUPPRESS
 
 DEFAULT_DB = Path(
 	os.environ.get(
@@ -53,10 +54,17 @@ def add_live_arguments(parser) -> None:
 	parser.add_argument("--seed-record-count", type=int, default=1)
 	parser.add_argument("--random-seed", type=int, default=1)
 	parser.add_argument(
-		"--valid-config-limit",
+		"--valid-evaluation-limit",
+		dest="valid_evaluation_limit",
 		type=int,
 		default=None,
-		help="Stop after this many unique valid compiled-and-run kernels.",
+		help="Stop after this many valid compiled-and-run kernel evaluations.",
+	)
+	parser.add_argument(
+		"--valid-config-limit",
+		dest="valid_evaluation_limit",
+		type=int,
+		help=SUPPRESS,
 	)
 	parser.add_argument("--invalid-runtime-ms", type=float, default=1.0e9)
 
@@ -75,7 +83,8 @@ def live_metadata(args, method: str) -> dict:
 		"device_type": args.device_type,
 		"seed_record_count": args.seed_record_count,
 		"random_seed": args.random_seed,
-		"valid_config_limit": args.valid_config_limit,
+		"valid_evaluation_limit": args.valid_evaluation_limit,
+		"budget_metric": "valid_evaluation_count",
 		"invalid_runtime_ms": args.invalid_runtime_ms,
 		"mode": "live",
 	}

@@ -13,7 +13,7 @@ from ..core.instruction_space import (
 	counts_from_tuning_indices,
 	nearest_indices_from_counts,
 )
-from ..core.resolver import DatabaseApproxInstructionMapResolver, ResolverWeights
+from ..core.resolver import DatabaseApproxInstructionMapResolver
 from .config_space import LiveConfigGenerator
 from .executor import LiveKernelExecutor, check_instruction_counter_available
 
@@ -40,7 +40,6 @@ def _compact_profile(profile) -> dict[str, Any]:
 		"param_hash": profile.param_hash,
 		"config": profile.config,
 		"instruction_map": dict(sorted(profile.raw_counts.items())),
-		"runtime_ms": profile.runtime_ms,
 	}
 
 
@@ -73,11 +72,6 @@ def run_diagnostic(args) -> dict[str, Any]:
 
 	resolver = DatabaseApproxInstructionMapResolver(
 		dataset,
-		weights=ResolverWeights(
-			raw=args.raw_weight,
-			normalized=args.normalized_weight,
-			total=args.total_weight,
-		),
 	)
 
 	start_index_config = nearest_indices_from_counts(start_profile.raw_counts, specs)
@@ -94,9 +88,6 @@ def run_diagnostic(args) -> dict[str, Any]:
 			"resolver_result": {
 				"status": resolution.status,
 				"distance": resolution.distance,
-				"raw_distance": resolution.raw_distance,
-				"mix_distance": resolution.mix_distance,
-				"total_distance": resolution.total_distance,
 				"duplicate_count": resolution.duplicate_count,
 				"resolver_time_ms": resolution.resolver_time_ms,
 			},
@@ -129,17 +120,15 @@ def run_diagnostic(args) -> dict[str, Any]:
 			},
 			"resolved_best_close_config": {
 				"profile_before_execution": _compact_profile(resolution.record),
+				"db_runtime_ms": resolution.record.runtime_ms,
 				"executed_profile": _compact_profile(execution.profile),
 				"resolver_result": {
 					"status": resolution.status,
 					"distance": resolution.distance,
-					"raw_distance": resolution.raw_distance,
-					"mix_distance": resolution.mix_distance,
-					"total_distance": resolution.total_distance,
 					"duplicate_count": resolution.duplicate_count,
 					"resolver_time_ms": resolution.resolver_time_ms,
 				},
-				"runtime_ms": execution.runtime_ms,
+				"executed_runtime_ms": execution.runtime_ms,
 			},
 		}
 
@@ -161,9 +150,6 @@ def build_argparser() -> argparse.ArgumentParser:
 	parser.add_argument("--device-type", choices=["cpu", "gpu"], default="cpu")
 	parser.add_argument("--random-seed", type=int, default=1)
 	parser.add_argument("--max-values-per-op", type=int, default=12)
-	parser.add_argument("--raw-weight", type=float, default=0.4)
-	parser.add_argument("--normalized-weight", type=float, default=0.5)
-	parser.add_argument("--total-weight", type=float, default=0.1)
 	return parser
 
 

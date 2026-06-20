@@ -30,10 +30,20 @@ from two_step_autotuning.core.parameter_space import (
 )
 from two_step_autotuning.core.parameter_resolver import DatabaseApproxParameterResolver
 from two_step_autotuning.core.resolver import DatabaseApproxInstructionMapResolver
+from two_step_autotuning.core.result_recorder import ResultRecorder, TRACE_FIELDS
 from two_step_autotuning.core.types import LiveProfile
 from two_step_autotuning.live.config_space import LiveConfigGenerator
+from two_step_autotuning.live.two_step_tuner import (
+	build_argparser as build_two_step_argparser,
+	resolver_distance_ratio,
+	resolver_mode_for_refinement_mode,
+)
+from scripts import collect_tuning_performance_simple as collector
 from scripts.internal.db_manager import ExperimentDB
-from two_step_autotuning.live.mutation import LocalInstructionMapMutator, instruction_map_distance
+from two_step_autotuning.live.inner_parameter_tuner import (
+	InnerParameterTuningInterface,
+	instruction_map_distance,
+)
 
 
 DB_PATH = ROOT / os.environ.get(
@@ -113,14 +123,9 @@ def test_instruction_distance_model_finds_zero_distance_for_same_record():
 	dataset = TuningDataset(DB_PATH, "gaussian", "512x512")
 	model = InstructionDistanceModel(dataset)
 
-	distances, raw_distances, mix_distances, total_distances = model.component_distances_to_counts(
-		dataset.records[10].raw_counts
-	)
+	distances = model.component_distances_to_counts(dataset.records[10].raw_counts)
 
 	assert distances[10] == 0.0
-	assert raw_distances[10] == 0.0
-	assert mix_distances[10] == 0.0
-	assert total_distances[10] == 0.0
 
 
 def test_parameter_resolver_returns_existing_record_for_exact_config():
@@ -200,6 +205,39 @@ def test_live_generator_parameter_space_roundtrips_gaussian_config():
 
 	assert decoded == config
 	assert indices
+	assert len(specs["g_cb_res_dest_level"].values) == 3
+	assert len(specs["wg_1_ocl_dim"].values) == 2
+	assert len(specs["wi_1_ocl_dim"].values) == 2
+
+
+def test_live_generator_validation_rejects_bad_gaussian_cache_hierarchy():
+	generator = LiveConfigGenerator("gaussian", "512x512", device_type="cpu", random_seed=1)
+	config = generator.generate(1)[0]
+	config["g_cb_res_dest_level"] = 0
+	config["l_cb_res_dest_level"] = 1
+	config["p_cb_res_dest_level"] = 0
+
+	assert not generator.validate_config(config)
+
+
+def test_live_generator_validation_rejects_duplicate_gaussian_ocl_dims():
+	generator = LiveConfigGenerator("gaussian", "512x512", device_type="cpu", random_seed=1)
+	config = generator.generate(1)[0]
+	config["wg_1_ocl_dim"] = 1
+	config["wg_2_ocl_dim"] = 1
+
+	assert not generator.validate_config(config)
+
+
+def test_live_generator_validation_accepts_swapped_gaussian_ocl_dims():
+	generator = LiveConfigGenerator("gaussian", "512x512", device_type="cpu", random_seed=1)
+	config = generator.generate(1)[0]
+	config["wg_1_ocl_dim"] = 0
+	config["wg_2_ocl_dim"] = 1
+	config["wi_1_ocl_dim"] = 0
+	config["wi_2_ocl_dim"] = 1
+
+	assert generator.validate_config(config)
 
 
 def test_live_generator_validation_rejects_invalid_gaussian_config():
@@ -267,6 +305,132 @@ def test_experiment_db_can_store_profiled_rows_by_key(tmp_path):
 	assert logs[0]["payload"] == {"successful_runs": 2, "attempted_runs": 3}
 
 
+def test_dataset_can_load_profiled_instruction_map_rows_without_runtime(tmp_path):
+	db_path = tmp_path / "profiled.db"
+	config = {
+		"input_size_h": 512,
+		"input_size_w": 512,
+		"g_cb_res_dest_level": 2,
+	}
+	with ExperimentDB(str(db_path)) as db:
+		exp_id = db.add_experiment("gaussian", "512x512", "abc", config)
+		assert exp_id is not None
+		db.upsert_llvm_instruction_counts(
+			exp_id=exp_id,
+			template_name="gaussian_static_1",
+			kernel_function="gaussian_1",
+			llvm_ir_path="transient://kernel.ll",
+			bb_counts={},
+			bb_instruction_counts={},
+			total_instruction_counts={"add": 12, "mul": 3},
+		)
+		assert db.mark_profiled(exp_id)
+
+	dataset = TuningDataset(db_path, "gaussian", "512x512", require_runtime=False)
+
+	assert len(dataset.records) == 1
+	assert dataset.records[0].runtime_ms is None
+	assert dataset.records[0].raw_counts == {"add": 12, "mul": 3}
+
+
+def test_dataset_runtime_required_skips_profiled_rows(tmp_path):
+	db_path = tmp_path / "profiled.db"
+	with ExperimentDB(str(db_path)) as db:
+		exp_id = db.add_experiment("gaussian", "512x512", "abc", {"input_size_h": 512, "input_size_w": 512})
+		assert exp_id is not None
+		db.upsert_llvm_instruction_counts(
+			exp_id=exp_id,
+			template_name="gaussian_static_1",
+			kernel_function="gaussian_1",
+			llvm_ir_path="transient://kernel.ll",
+			bb_counts={},
+			bb_instruction_counts={},
+			total_instruction_counts={"add": 12},
+		)
+		assert db.mark_profiled(exp_id)
+
+	try:
+		TuningDataset(db_path, "gaussian", "512x512")
+	except ValueError as exc:
+		assert "No completed records" in str(exc)
+	else:
+		raise AssertionError("runtime-required dataset should reject profiled-only rows")
+
+
+def test_instruction_map_only_worker_marks_row_profiled_without_runtime(tmp_path, monkeypatch):
+	db_path = tmp_path / "experiments.db"
+	llvm_dir = tmp_path / "llvm"
+	config_path = tmp_path / "config.json"
+	config = {
+		"input_size_h": 512,
+		"input_size_w": 512,
+		"g_cb_res_dest_level": 2,
+	}
+	config_path.write_text(__import__("json").dumps(config))
+	param_hash = collector.hash_config(config)
+	with ExperimentDB(str(db_path)) as db:
+		exp_id = db.add_experiment("gaussian", "512x512", param_hash, config)
+		assert exp_id is not None
+
+	def fake_dump(kernel_type, config_file, build_dir, dump_opencl_binary):
+		return collector.KernelRunResult(runtime_ms=0.0, returncode=0)
+
+	def fake_extract(kernel_type, config_dict, param_hash_value, llvm_output_dir, opencl_binary_path, persist_artifacts):
+		artifact_path = Path(llvm_output_dir) / "fake.ll"
+		artifact_path.parent.mkdir(parents=True, exist_ok=True)
+		artifact_path.write_text("; fake")
+		return collector.RuntimeIRResult(
+			artifacts=[
+				{
+					"template_name": "gaussian_static_1",
+					"kernel_function": "gaussian_1",
+					"llvm_ir_path": str(artifact_path),
+					"llvm_ir_ref": "transient://fake.ll",
+				}
+			]
+		)
+
+	def fake_store(db, exp_id_value, llvm_artifacts):
+		db.upsert_llvm_instruction_counts(
+			exp_id=exp_id_value,
+			template_name="gaussian_static_1",
+			kernel_function="gaussian_1",
+			llvm_ir_path="transient://fake.ll",
+			bb_counts={},
+			bb_instruction_counts={},
+			total_instruction_counts={"add": 5},
+		)
+		return []
+
+	monkeypatch.setattr(collector, "dump_opencl_binary_only", fake_dump)
+	monkeypatch.setattr(collector, "_extract_runtime_ir_result", fake_extract)
+	monkeypatch.setattr(collector, "_store_symbolic_instruction_counts", fake_store)
+
+	result = collector.process_single_experiment(
+		(
+			exp_id,
+			"gaussian",
+			str(config_path),
+			str(db_path),
+			str(llvm_dir),
+			"build",
+			1,
+			False,
+			"instruction-map-only",
+		)
+	)
+
+	with ExperimentDB(str(db_path)) as db:
+		row = db.get_experiment_by_key("gaussian", "512x512", param_hash)
+		counts = db.get_llvm_instruction_counts(exp_id)
+
+	assert result == (exp_id, True, "")
+	assert row is not None
+	assert row.status == "profiled"
+	assert row.runtime_ms is None
+	assert counts[0]["total_instruction_counts"] == {"add": 5}
+
+
 def test_instruction_map_distance_ignores_excluded_ops():
 	requested = {"add": 10, "mul": 4, "lifetime.start": 100}
 	candidate = {"add": 13, "mul": 8, "lifetime.end": 200}
@@ -274,131 +438,236 @@ def test_instruction_map_distance_ignores_excluded_ops():
 	assert instruction_map_distance(requested, candidate) == 5.0
 
 
-def test_local_instruction_map_mutator_budget_zero_keeps_reference():
+def test_normalized_instruction_map_distance_uses_scale_opcode_set():
+	requested = {"add": 10}
+	candidate = {"add": 14, "extra.live.op": 1000000}
+
+	assert instruction_map_distance(requested, candidate, {"add": 2.0}) == 2.0
+
+
+class FakeProfileResult:
+	def __init__(self, profile):
+		self.profile = profile
+
+	@property
+	def valid(self):
+		return self.profile is not None
+
+
+class FakeInnerExecutor:
+	def __init__(self, profiles_by_key):
+		self.profiles_by_key = profiles_by_key
+		self.calls = []
+
+	def profile_config(self, config):
+		self.calls.append(config)
+		return FakeProfileResult(self.profiles_by_key.get(canonical_config_key(config)))
+
+
+def _inner_args(**overrides):
+	from types import SimpleNamespace
+
+	values = {
+		"parallel_compile": False,
+		"resolver_inner_valid_profile_limit": 32,
+		"resolver_inner_test_limit": 512,
+		"resolver_inner_target_ratio": 0.1,
+		"resolver_inner_invalid_distance_penalty": 1.0e12,
+	}
+	values.update(overrides)
+	return SimpleNamespace(**values)
+
+
+def test_inner_parameter_tuner_seed_list_contains_only_db_config():
 	generator = LiveConfigGenerator("gaussian", "512x512", device_type="cpu", random_seed=1)
-	executor = type("Executor", (), {})()
-	mutator = LocalInstructionMapMutator(generator, executor, mutation_budget=0)
 	config = generator.generate(1)[0]
-	profile = LiveProfile(
-		1,
-		"gaussian",
-		"512x512",
-		"seed",
-		config,
+	profile = LiveProfile(1, "gaussian", "512x512", "seed", config, {"add": 10, "mul": 4})
+	executor = FakeInnerExecutor({canonical_config_key(config): profile})
+	tuner = InnerParameterTuningInterface(
+		_inner_args(),
+		generator,
+		executor,
 		{"add": 10, "mul": 4},
+		profile,
+		0.0,
 	)
 
-	result = mutator.refine({"add": 10, "mul": 4}, profile)
+	seeds = tuner.seed_configurations()
+
+	assert len(seeds) == 1
+	assert seeds[0] == indices_from_config(config, tuner.parameter_specs)
+
+
+def test_inner_parameter_tuner_invalid_decoded_config_returns_penalty():
+	generator = LiveConfigGenerator("gaussian", "512x512", device_type="cpu", random_seed=1)
+	config = generator.generate(1)[0]
+	profile = LiveProfile(1, "gaussian", "512x512", "seed", config, {"add": 10, "mul": 4})
+	executor = FakeInnerExecutor({canonical_config_key(config): profile})
+	tuner = InnerParameterTuningInterface(
+		_inner_args(resolver_inner_invalid_distance_penalty=12345.0),
+		generator,
+		executor,
+		{"add": 10, "mul": 4},
+		profile,
+		0.0,
+	)
+	index_config = indices_from_config(config, tuner.parameter_specs)
+	index_config["idx.g_cb_res_dest_level"] = 0
+	index_config["idx.l_cb_res_dest_level"] = 1
+	index_config["idx.p_cb_res_dest_level"] = 0
+	from types import SimpleNamespace
+
+	result = tuner.run(SimpleNamespace(configuration=SimpleNamespace(data=index_config)))
+
+	assert result.time == 12345.0
+	assert tuner.invalid_count == 1
+	assert tuner.best_profile is None
+
+
+def test_inner_parameter_tuner_valid_profile_distance_is_result_time():
+	generator = LiveConfigGenerator("gaussian", "512x512", device_type="cpu", random_seed=1)
+	config = generator.generate(1)[0]
+	profile = LiveProfile(1, "gaussian", "512x512", "seed", config, {"add": 13, "mul": 8})
+	executor = FakeInnerExecutor({canonical_config_key(config): profile})
+	tuner = InnerParameterTuningInterface(
+		_inner_args(),
+		generator,
+		executor,
+		{"add": 10, "mul": 4},
+		profile,
+		5.0,
+	)
+	from types import SimpleNamespace
+
+	result = tuner.run(
+		SimpleNamespace(configuration=SimpleNamespace(data=indices_from_config(config, tuner.parameter_specs)))
+	)
+
+	assert result.time == 5.0
+	assert tuner.best_profile == profile
+	assert tuner.best_distance == 5.0
+
+
+def test_inner_parameter_tuner_target_hit_stops_after_seed():
+	generator = LiveConfigGenerator("gaussian", "512x512", device_type="cpu", random_seed=1)
+	config = generator.generate(1)[0]
+	profile = LiveProfile(1, "gaussian", "512x512", "seed", config, {"add": 10, "mul": 4})
+	executor = FakeInnerExecutor({canonical_config_key(config): profile})
+	tuner = InnerParameterTuningInterface(
+		_inner_args(resolver_inner_target_ratio=0.1),
+		generator,
+		executor,
+		{"add": 10, "mul": 4},
+		profile,
+		10.0,
+	)
+
+	result = tuner.tune()
+
+	assert result.target_hit
+	assert result.total_tests == 1
+	assert result.valid_profile_count == 1
+
+
+def test_inner_parameter_tuner_budget_exhaustion_returns_best_valid_profile():
+	generator = LiveConfigGenerator("gaussian", "512x512", device_type="cpu", random_seed=1)
+	config = generator.generate(1)[0]
+	profile = LiveProfile(1, "gaussian", "512x512", "seed", config, {"add": 13, "mul": 8})
+	executor = FakeInnerExecutor({canonical_config_key(config): profile})
+	tuner = InnerParameterTuningInterface(
+		_inner_args(resolver_inner_test_limit=1, resolver_inner_target_ratio=0.0),
+		generator,
+		executor,
+		{"add": 10, "mul": 4},
+		profile,
+		5.0,
+	)
+
+	result = tuner.tune()
 
 	assert result.profile == profile
-	assert result.distance == 0.0
-	assert result.source == "database"
+	assert result.distance == 5.0
+	assert result.total_tests == 1
 
 
-def test_local_instruction_map_mutator_can_pick_closer_neighbor():
+def test_inner_parameter_tuner_zero_db_distance_ratio_is_safe():
 	generator = LiveConfigGenerator("gaussian", "512x512", device_type="cpu", random_seed=1)
 	config = generator.generate(1)[0]
-
-	class FakeResult:
-		def __init__(self, profile):
-			self.profile = profile
-
-		@property
-		def valid(self):
-			return self.profile is not None
-
-	class FakeExecutor:
-		def __init__(self, profiles_by_key):
-			self.profiles_by_key = profiles_by_key
-
-		def profile_config(self, config):
-			return FakeResult(self.profiles_by_key.get(canonical_config_key(config)))
-
-	reference_profile = LiveProfile(
-		1,
-		"gaussian",
-		"512x512",
-		"ref",
-		config,
-		{"add": 50, "mul": 20},
+	profile = LiveProfile(1, "gaussian", "512x512", "seed", config, {"add": 10, "mul": 4})
+	executor = FakeInnerExecutor({canonical_config_key(config): profile})
+	tuner = InnerParameterTuningInterface(
+		_inner_args(),
+		generator,
+		executor,
+		{"add": 10, "mul": 4},
+		profile,
+		0.0,
 	)
-	executor = FakeExecutor({})
-	mutator = LocalInstructionMapMutator(generator, executor, mutation_budget=4)
-	neighbors = mutator._neighbor_configs(
-		indices_from_config(config, mutator.parameter_specs),
-		{tuple(sorted(config.items()))},
+
+	result = tuner.tune()
+
+	assert result.distance_ratio == 1.0
+	assert result.target_distance == 0.0
+	assert result.target_hit
+
+
+def test_resolver_distance_ratio_handles_zero_and_missing_values():
+	assert resolver_distance_ratio(10.0, 2.5) == 0.25
+	assert resolver_distance_ratio(0.0, 0.0) == 1.0
+	assert resolver_distance_ratio(None, 1.0) is None
+	assert resolver_distance_ratio(1.0, None) is None
+	assert resolver_distance_ratio(0.0, 1.0) is None
+
+
+def test_resolver_mode_reflects_refinement_mode():
+	assert resolver_mode_for_refinement_mode("database") == "database_only"
+	assert resolver_mode_for_refinement_mode("inner-tuner") == "database_plus_inner_tuner"
+
+
+def test_two_step_help_no_longer_exposes_mutation_flags():
+	help_text = build_two_step_argparser().format_help()
+
+	assert "resolver-mutation-budget" not in help_text
+	assert "mutation" not in help_text
+	assert "resolver-refinement-mode" in help_text
+
+
+def test_result_recorder_accepts_resolver_diagnostic_fields(tmp_path):
+	assert "db_resolver_distance" in TRACE_FIELDS
+	assert "refined_resolver_distance" in TRACE_FIELDS
+	assert "distance_ratio" in TRACE_FIELDS
+	assert "resolver_source" in TRACE_FIELDS
+	assert "inner_valid_profile_count" in TRACE_FIELDS
+
+	recorder = ResultRecorder(tmp_path, {"method": "test"})
+	recorder.record(
+		{
+			"candidate_status": "inner_tuned_valid",
+			"runtime_ms": 1.25,
+			"exp_id": 7,
+			"param_hash": "resolved",
+			"resolver_distance": 2.0,
+			"db_resolver_distance": 20.0,
+			"refined_resolver_distance": 2.0,
+			"distance_ratio": 0.1,
+			"resolver_source": "inner_tuner",
+			"db_param_hash": "db",
+			"resolved_param_hash": "resolved",
+			"resolver_profile_count": 4,
+			"resolver_time_ms": 0.5,
+			"resolver_refinement_time_ms": 12.0,
+			"duplicate_count": 1,
+			"inner_valid_profile_count": 4,
+			"inner_total_tests": 9,
+			"inner_invalid_count": 5,
+			"inner_target_distance": 2.0,
+			"inner_target_hit": True,
+			"inner_wall_time_ms": 12.0,
+		}
 	)
-	assert neighbors
-	neighbor_config, _ = neighbors[0]
-	neighbor_profile = LiveProfile(
-		2,
-		"gaussian",
-		"512x512",
-		"neighbor",
-		neighbor_config,
-		{"add": 12, "mul": 5},
-	)
-	executor.profiles_by_key[canonical_config_key(neighbor_config)] = neighbor_profile
 
-	result = mutator.refine({"add": 10, "mul": 4}, reference_profile)
-
-	assert result.profile == neighbor_profile
-	assert result.source == "mutation"
-	assert result.distance < instruction_map_distance({"add": 10, "mul": 4}, reference_profile.raw_counts)
-
-
-def test_local_instruction_map_mutator_caches_profiled_neighbors():
-	generator = LiveConfigGenerator("gaussian", "512x512", device_type="cpu", random_seed=1)
-	config = generator.generate(1)[0]
-
-	class FakeResult:
-		def __init__(self, profile):
-			self.profile = profile
-
-		@property
-		def valid(self):
-			return self.profile is not None
-
-	class CountingExecutor:
-		def __init__(self, profiles_by_key):
-			self.profiles_by_key = profiles_by_key
-			self.calls = 0
-
-		def profile_config(self, config):
-			self.calls += 1
-			return FakeResult(self.profiles_by_key.get(canonical_config_key(config)))
-
-	reference_profile = LiveProfile(
-		1,
-		"gaussian",
-		"512x512",
-		"ref",
-		config,
-		{"add": 50, "mul": 20},
-	)
-	executor = CountingExecutor({})
-	mutator = LocalInstructionMapMutator(generator, executor, mutation_budget=4)
-	neighbors = mutator._neighbor_configs(
-		indices_from_config(config, mutator.parameter_specs),
-		{tuple(sorted(config.items()))},
-	)
-	assert neighbors
-	neighbor_config, _ = neighbors[0]
-	neighbor_profile = LiveProfile(
-		2,
-		"gaussian",
-		"512x512",
-		"neighbor",
-		neighbor_config,
-		{"add": 12, "mul": 5},
-	)
-	executor.profiles_by_key[canonical_config_key(neighbor_config)] = neighbor_profile
-
-	first_profile, first_cache_hit = mutator._profile_or_cache_hit(neighbor_config)
-	second_profile, second_cache_hit = mutator._profile_or_cache_hit(neighbor_config)
-
-	assert first_profile == neighbor_profile
-	assert second_profile == neighbor_profile
-	assert not first_cache_hit
-	assert second_cache_hit
-	assert executor.calls == 1
+	trace = (tmp_path / "trace.csv").read_text()
+	assert "db_resolver_distance" in trace
+	assert "20.0" in trace
+	assert "inner_tuned_valid" in trace
+	assert "inner_valid_profile_count" in trace

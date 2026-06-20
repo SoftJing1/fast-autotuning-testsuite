@@ -49,8 +49,9 @@ class ExperimentDB:
 
 	def _connect(self) -> None:
 		try:
-			self.conn = sqlite3.connect(self.db_path)
+			self.conn = sqlite3.connect(self.db_path, timeout=60.0)
 			self.conn.row_factory = sqlite3.Row
+			self.conn.execute("PRAGMA busy_timeout = 60000")
 		except sqlite3.Error as e:
 			raise RuntimeError(f"Failed to connect to database {self.db_path}: {e}")
 
@@ -479,6 +480,10 @@ class ExperimentDB:
 				"SELECT COUNT(*) FROM experiments WHERE status = ?",
 				("completed",),
 			).fetchone()[0]
+			profiled = self._execute(
+				"SELECT COUNT(*) FROM experiments WHERE status = ?",
+				("profiled",),
+			).fetchone()[0]
 			failed = self._execute(
 				"SELECT COUNT(*) FROM experiments WHERE status = ?",
 				("failed",),
@@ -494,6 +499,7 @@ class ExperimentDB:
 			return {
 				"total": total,
 				"completed": completed,
+				"profiled": profiled,
 				"failed": failed,
 				"pending": pending,
 				"avg_runtime_ms": avg_runtime,
