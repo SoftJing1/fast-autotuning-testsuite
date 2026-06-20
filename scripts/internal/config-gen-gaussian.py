@@ -69,10 +69,8 @@ def get_parameters_definition(H: int, W: int) -> ConfigurationManipulator:
     manipulator.add_parameter(IntegerParameter('P_CB_RES_DEST_LEVEL', 0, 2))
 
     # Cache flags - enable/disable caching at different levels
-    manipulator.add_parameter(IntegerParameter('IMAGES_CACHE_LCL', 0, 1))
-    manipulator.add_parameter(IntegerParameter('IMAGES_CACHE_PRV', 0, 1))
-    manipulator.add_parameter(IntegerParameter('FILTER_CACHE_LCL', 0, 1))
-    manipulator.add_parameter(IntegerParameter('FILTER_CACHE_PRV', 0, 1))
+    manipulator.add_parameter(IntegerParameter('IN_CACHE_LCL', 0, 1))
+    manipulator.add_parameter(IntegerParameter('IN_CACHE_PRV', 0, 1))
     manipulator.add_parameter(IntegerParameter('OUT_CACHE_PRV', 0, 1))
 
     # Work group dimensions
@@ -115,10 +113,8 @@ def get_parameters_info() -> Dict:
             "P_CB_RES_DEST_LEVEL": "Private cache resolution destination level",
         },
         "cache_flags": {
-            "IMAGES_CACHE_LCL": "Cache images in local memory",
-            "IMAGES_CACHE_PRV": "Cache images in private memory",
-            "FILTER_CACHE_LCL": "Cache filter in local memory",
-            "FILTER_CACHE_PRV": "Cache filter in private memory",
+            "IN_CACHE_LCL": "Cache input in local memory",
+            "IN_CACHE_PRV": "Cache input in private memory",
             "OUT_CACHE_PRV": "Cache output in private memory",
         },
         "work_group_dimensions": {
@@ -521,10 +517,8 @@ def exhaustive_iterate_configurations(
 
     # Variable parameters with their ranges
     cache_flags = {
-        'IMAGES_CACHE_LCL': [0, 1],
-        'IMAGES_CACHE_PRV': [0, 1],
-        'FILTER_CACHE_LCL': [0, 1],
-        'FILTER_CACHE_PRV': [0, 1],
+        'IN_CACHE_LCL': [0, 1],
+        'IN_CACHE_PRV': [0, 1],
         'OUT_CACHE_PRV': [0, 1],
     }
 
@@ -645,10 +639,8 @@ def random_sample_configurations(
     }
 
     cache_flags = {
-        'IMAGES_CACHE_LCL': [0, 1],
-        'IMAGES_CACHE_PRV': [0, 1],
-        'FILTER_CACHE_LCL': [0, 1],
-        'FILTER_CACHE_PRV': [0, 1],
+        'IN_CACHE_LCL': [0, 1],
+        'IN_CACHE_PRV': [0, 1],
         'OUT_CACHE_PRV': [0, 1],
     }
 

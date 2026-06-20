@@ -112,13 +112,11 @@ def _build_gaussian_generator_specs(
 			for key, values in dim2.items():
 				dim2_values[key.lower()].update(values)
 	return {
-		"g_cb_res_dest_level": ParameterIndexSpec("g_cb_res_dest_level", (0, 1, 2)),
-		"l_cb_res_dest_level": ParameterIndexSpec("l_cb_res_dest_level", (0, 1, 2)),
-		"p_cb_res_dest_level": ParameterIndexSpec("p_cb_res_dest_level", (0, 1, 2)),
-		"images_cache_lcl": ParameterIndexSpec("images_cache_lcl", (0, 1)),
-		"images_cache_prv": ParameterIndexSpec("images_cache_prv", (0, 1)),
-		"filter_cache_lcl": ParameterIndexSpec("filter_cache_lcl", (0, 1)),
-		"filter_cache_prv": ParameterIndexSpec("filter_cache_prv", (0, 1)),
+		"g_cb_res_dest_level": ParameterIndexSpec("g_cb_res_dest_level", (2,)),
+		"l_cb_res_dest_level": ParameterIndexSpec("l_cb_res_dest_level", (0,)),
+		"p_cb_res_dest_level": ParameterIndexSpec("p_cb_res_dest_level", (0,)),
+		"in_cache_lcl": ParameterIndexSpec("in_cache_lcl", (0, 1)),
+		"in_cache_prv": ParameterIndexSpec("in_cache_prv", (0, 1)),
 		"out_cache_prv": ParameterIndexSpec("out_cache_prv", (0, 1)),
 		"wg_1_ocl_dim": ParameterIndexSpec("wg_1_ocl_dim", (0, 1)),
 		"wg_2_ocl_dim": ParameterIndexSpec("wg_2_ocl_dim", (0, 1)),

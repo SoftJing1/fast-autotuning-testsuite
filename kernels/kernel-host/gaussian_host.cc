@@ -125,10 +125,8 @@ struct GaussianConfig {
   int g_cb_res_dest_level = -1;
   int l_cb_res_dest_level = -1;
   int p_cb_res_dest_level = -1;
-  int images_cache_lcl = -1;
-  int images_cache_prv = -1;
-  int filter_cache_lcl = -1;
-  int filter_cache_prv = -1;
+  int in_cache_lcl = -1;
+  int in_cache_prv = -1;
   int out_cache_prv = -1;
   int wg_1_ocl_dim = -1;
   int wg_2_ocl_dim = -1;
@@ -175,14 +173,10 @@ GaussianConfig load_config_from_json(const std::string &json_path) {
       config.l_cb_res_dest_level = j["l_cb_res_dest_level"];
     if (j.contains("p_cb_res_dest_level"))
       config.p_cb_res_dest_level = j["p_cb_res_dest_level"];
-    if (j.contains("images_cache_lcl"))
-      config.images_cache_lcl = j["images_cache_lcl"];
-    if (j.contains("images_cache_prv"))
-      config.images_cache_prv = j["images_cache_prv"];
-    if (j.contains("filter_cache_lcl"))
-      config.filter_cache_lcl = j["filter_cache_lcl"];
-    if (j.contains("filter_cache_prv"))
-      config.filter_cache_prv = j["filter_cache_prv"];
+    if (j.contains("in_cache_lcl"))
+      config.in_cache_lcl = j["in_cache_lcl"];
+    if (j.contains("in_cache_prv"))
+      config.in_cache_prv = j["in_cache_prv"];
     if (j.contains("out_cache_prv"))
       config.out_cache_prv = j["out_cache_prv"];
     if (j.contains("wg_1_ocl_dim"))
@@ -588,10 +582,8 @@ int main(int argc, char *argv[]) {
       std::to_string(config.g_cb_res_dest_level) +
       " -DL_CB_RES_DEST_LEVEL=" + std::to_string(config.l_cb_res_dest_level) +
       " -DP_CB_RES_DEST_LEVEL=" + std::to_string(config.p_cb_res_dest_level) +
-      " -DIMAGES_CACHE_LCL=" + std::to_string(config.images_cache_lcl) +
-      " -DIMAGES_CACHE_PRV=" + std::to_string(config.images_cache_prv) +
-      " -DFILTER_CACHE_LCL=" + std::to_string(config.filter_cache_lcl) +
-      " -DFILTER_CACHE_PRV=" + std::to_string(config.filter_cache_prv) +
+      " -DIN_CACHE_LCL=" + std::to_string(config.in_cache_lcl) +
+      " -DIN_CACHE_PRV=" + std::to_string(config.in_cache_prv) +
       " -DOUT_CACHE_PRV=" + std::to_string(config.out_cache_prv) +
       " -DWG_1_OCL_DIM=" + std::to_string(config.wg_1_ocl_dim) +
       " -DWG_2_OCL_DIM=" + std::to_string(config.wg_2_ocl_dim) +
